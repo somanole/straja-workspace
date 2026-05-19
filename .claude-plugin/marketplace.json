@@ -1,0 +1,29 @@
+{
+	"name": "straja-vault",
+	"owner": {
+		"name": "Straja.ai",
+		"email": "hello@straja.ai"
+	},
+	"plugins": [
+		{
+			"name": "straja-vault",
+			"source": "./",
+			"description": "Persistent document store with hybrid search, sandboxed code execution, long-term memory, and process management — exposed as MCP tools for AI agents.",
+			"version": "0.1.0",
+			"author": {
+				"name": "Sorin Manole",
+				"email": "hello@straja.ai"
+			},
+			"repository": "https://github.com/straja-ai/straja-vault",
+			"license": "MIT",
+			"keywords": ["ai", "mcp", "search", "documents", "memory", "execution", "straja", "vault"],
+			"skills": ["./skills/"],
+			"mcpServers": {
+				"straja-vault": {
+					"command": "straja-vault",
+					"args": ["mcp"]
+				}
+			}
+		}
+	]
+}

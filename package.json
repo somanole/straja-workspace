@@ -1,0 +1,88 @@
+{
+  "name": "@straja/vault",
+  "version": "0.1.0",
+  "description": "Straja Vault - On-device hybrid search and secure document retrieval with BM25, vector search, and LLM reranking",
+  "type": "module",
+  "bin": {
+    "straja-vault": "straja-vault"
+  },
+  "files": [
+    "dist/",
+    "straja-vault",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "scripts": {
+    "prepare": "[ -d .git ] && ./scripts/install-hooks.sh || true",
+    "build": "tsc -p tsconfig.build.json",
+    "test": "vitest run --reporter=verbose test/",
+    "vault": "tsx src/vault.ts",
+    "index": "tsx src/vault.ts index",
+    "vector": "tsx src/vault.ts vector",
+    "search": "tsx src/vault.ts search",
+    "vsearch": "tsx src/vault.ts vsearch",
+    "rerank": "tsx src/vault.ts rerank",
+    "inspector": "npx @modelcontextprotocol/inspector tsx src/vault.ts mcp",
+    "web:dev": "cd web && npm run dev",
+    "web:build": "cd web && npm run build",
+    "release": "./scripts/release.sh"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.25.1",
+    "@mozilla/readability": "^0.5.0",
+    "@playwright/mcp": "^0.0.68",
+    "better-sqlite3": "^11.0.0",
+    "better-sqlite3-multiple-ciphers": "^12.6.2",
+    "fast-glob": "^3.3.0",
+    "googleapis": "^171.4.0",
+    "linkedom": "^0.18.0",
+    "node-llama-cpp": "^3.14.5",
+    "pdf-parse": "^2.4.5",
+    "picomatch": "^4.0.0",
+    "pptxgenjs": "^3.12.0",
+    "sqlite-vec": "^0.1.7-alpha.2",
+    "xlsx": "^0.18.5",
+    "yaml": "^2.8.2",
+    "zod": "^4.2.1"
+  },
+  "optionalDependencies": {
+    "sqlite-vec-darwin-arm64": "^0.1.7-alpha.2",
+    "sqlite-vec-darwin-x64": "^0.1.7-alpha.2",
+    "sqlite-vec-linux-x64": "^0.1.7-alpha.2",
+    "sqlite-vec-win32-x64": "^0.1.7-alpha.2"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.0",
+    "tsx": "^4.0.0",
+    "vitest": "^3.0.0"
+  },
+  "peerDependencies": {
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "keywords": [
+    "markdown",
+    "search",
+    "fts",
+    "full-text-search",
+    "vector",
+    "semantic-search",
+    "sqlite",
+    "bm25",
+    "embeddings",
+    "rag",
+    "mcp",
+    "reranking",
+    "knowledge-base",
+    "local-ai",
+    "llm",
+    "straja",
+    "vault"
+  ],
+  "license": "SEE LICENSE IN LICENSE"
+}

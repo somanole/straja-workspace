@@ -1,0 +1,3207 @@
+// ---------------------------------------------------------------------------
+// Load .env file before any other imports (no external deps).
+// Searches: cwd, then the package root (one level up from dist/).
+// ---------------------------------------------------------------------------
+import { readFileSync as _readFileSync, existsSync as _existsSync } from "fs";
+import { resolve as _resolve, dirname as _dirname } from "path";
+import { fileURLToPath as _fileURLToPath } from "url";
+
+{
+  const __filename = _fileURLToPath(import.meta.url);
+  const packageRoot = _resolve(_dirname(__filename), "..");   // dist/ → project root
+  let cwdCandidate = process.env.PWD;
+  if (!cwdCandidate || !cwdCandidate.trim()) {
+    try {
+      cwdCandidate = process.cwd();
+    } catch {
+      cwdCandidate = process.env.HOME || "/tmp";
+    }
+  }
+
+  const candidates = [
+    _resolve(cwdCandidate, ".env"),
+    _resolve(packageRoot, ".env"),
+  ];
+
+  for (const envPath of candidates) {
+    if (!_existsSync(envPath)) continue;
+    for (const line of _readFileSync(envPath, "utf-8").split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#")) continue;
+      const eqIdx = trimmed.indexOf("=");
+      if (eqIdx === -1) continue;
+      const key = trimmed.slice(0, eqIdx).trim();
+      let val = trimmed.slice(eqIdx + 1).trim();
+      // Strip surrounding quotes
+      if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+        val = val.slice(1, -1);
+      }
+      if (!(key in process.env)) {
+        process.env[key] = val;
+      }
+    }
+    break; // use the first .env found
+  }
+}
+
+// ---------------------------------------------------------------------------
+import { openDatabase } from "./db.js";
+import type { Database } from "./db.js";
+import fastGlob from "fast-glob";
+import { execSync, spawn as nodeSpawn } from "child_process";
+import { fileURLToPath } from "url";
+import { dirname, isAbsolute, join as pathJoin } from "path";
+import { parseArgs } from "util";
+import { readFileSync, statSync, existsSync, unlinkSync, writeFileSync, openSync, closeSync, mkdirSync } from "fs";
+import {
+  getPwd,
+  getRealPath,
+  homedir,
+  resolve,
+  enableProductionMode,
+  searchFTS,
+  extractSnippet,
+  getContextForFile,
+  getContextForPath,
+  listCollections,
+  removeCollection,
+  renameCollection,
+  findSimilarFiles,
+  findDocumentByDocid,
+  isDocid,
+  matchFilesByGlob,
+  getHashesNeedingEmbedding,
+  getHashesForEmbedding,
+  clearAllEmbeddings,
+  insertEmbedding,
+  getStatus,
+  hashContent,
+  extractTitle,
+  formatDocForEmbedding,
+  chunkDocumentByTokens,
+  clearCache,
+  getCacheKey,
+  getCachedResult,
+  setCachedResult,
+  getIndexHealth,
+  parseVirtualPath,
+  buildVirtualPath,
+  isVirtualPath,
+  resolveVirtualPath,
+  toVirtualPath,
+  insertContent,
+  insertDocument,
+  findActiveDocument,
+  updateDocumentTitle,
+  updateDocument,
+  deactivateDocument,
+  getActiveDocumentPaths,
+  cleanupOrphanedContent,
+  deleteLLMCache,
+  deleteInactiveDocuments,
+  cleanupOrphanedVectors,
+  vacuumDatabase,
+  getCollectionsWithoutContext,
+  getTopLevelPathsWithoutContext,
+  handelize,
+  INDEX_SEPARATOR,
+  isIndexPath,
+  getBasePath,
+  buildIndexPath,
+  isBinaryImportExt,
+  hybridQuery,
+  vectorSearchQuery,
+  structuredSearch,
+  addLineNumbers,
+  type ExpandedQuery,
+  type StructuredSubSearch,
+  DEFAULT_EMBED_MODEL,
+  DEFAULT_RERANK_MODEL,
+  DEFAULT_GLOB,
+  DEFAULT_MULTI_GET_MAX_BYTES,
+  createStore,
+  getDefaultDbPath,
+} from "./store.js";
+import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_ANSWER_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "./llm.js";
+import {
+  formatSearchResults,
+  formatDocuments,
+  escapeXml,
+  escapeCSV,
+  type OutputFormat,
+} from "./formatter.js";
+import {
+  getCollection as getCollectionFromYaml,
+  listCollections as yamlListCollections,
+  getDefaultCollectionNames,
+  addContext as yamlAddContext,
+  removeContext as yamlRemoveContext,
+  setGlobalContext,
+  listAllContexts,
+  setConfigIndexName,
+} from "./collections.js";
+import { encodeBrowserUploadBlobEnvelope } from "./browser-upload-staging.js";
+
+// Enable production mode - allows using default database path
+// Tests must set INDEX_PATH or use createStore() with explicit path
+enableProductionMode();
+
+// =============================================================================
+// Store/DB lifecycle (no legacy singletons in store.ts)
+// =============================================================================
+
+let store: ReturnType<typeof createStore> | null = null;
+let storeDbPathOverride: string | undefined;
+
+function getStore(): ReturnType<typeof createStore> {
+  if (!store) {
+    store = createStore(storeDbPathOverride);
+  }
+  return store;
+}
+
+function getDb(): Database {
+  return getStore().db;
+}
+
+function closeDb(): void {
+  if (store) {
+    store.close();
+    store = null;
+  }
+}
+
+function getDbPath(): string {
+  return store?.dbPath ?? storeDbPathOverride ?? getDefaultDbPath();
+}
+
+function setIndexName(name: string | null): void {
+  let normalizedName = name;
+  // Normalize relative paths to prevent malformed database paths
+  if (name && name.includes('/')) {
+    const { resolve } = require('path');
+    const { cwd } = require('process');
+    const absolutePath = resolve(cwd(), name);
+    // Replace path separators with underscores to create a valid filename
+    normalizedName = absolutePath.replace(/\//g, '_').replace(/^_/, '');
+  }
+  storeDbPathOverride = normalizedName ? getDefaultDbPath(normalizedName) : undefined;
+  // Reset open handle so next use opens the new index
+  closeDb();
+}
+
+function ensureVecTable(_db: Database, dimensions: number): void {
+  // Store owns the DB; ignore `_db` and ensure vec table on the active store
+  getStore().ensureVecTable(dimensions);
+}
+
+// Terminal colors (respects NO_COLOR env)
+const useColor = !process.env.NO_COLOR && process.stdout.isTTY;
+const c = {
+  reset: useColor ? "\x1b[0m" : "",
+  dim: useColor ? "\x1b[2m" : "",
+  bold: useColor ? "\x1b[1m" : "",
+  cyan: useColor ? "\x1b[36m" : "",
+  yellow: useColor ? "\x1b[33m" : "",
+  green: useColor ? "\x1b[32m" : "",
+  magenta: useColor ? "\x1b[35m" : "",
+  blue: useColor ? "\x1b[34m" : "",
+};
+
+// Terminal cursor control
+const cursor = {
+  hide() { process.stderr.write('\x1b[?25l'); },
+  show() { process.stderr.write('\x1b[?25h'); },
+};
+
+// Ensure cursor is restored on exit
+process.on('SIGINT', () => { cursor.show(); process.exit(130); });
+process.on('SIGTERM', () => { cursor.show(); process.exit(143); });
+
+// Terminal progress bar using OSC 9;4 escape sequence
+const progress = {
+  set(percent: number) {
+    process.stderr.write(`\x1b]9;4;1;${Math.round(percent)}\x07`);
+  },
+  clear() {
+    process.stderr.write(`\x1b]9;4;0\x07`);
+  },
+  indeterminate() {
+    process.stderr.write(`\x1b]9;4;3\x07`);
+  },
+  error() {
+    process.stderr.write(`\x1b]9;4;2\x07`);
+  },
+};
+
+// Format seconds into human-readable ETA
+function formatETA(seconds: number): string {
+  if (seconds < 60) return `${Math.round(seconds)}s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s`;
+  return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
+}
+
+
+// Check index health and print warnings/tips
+function checkIndexHealth(db: Database): void {
+  const { needsEmbedding, totalDocs, daysStale } = getIndexHealth(db);
+
+  // Warn if many docs need embedding
+  if (needsEmbedding > 0) {
+    const pct = Math.round((needsEmbedding / totalDocs) * 100);
+    if (pct >= 10) {
+      process.stderr.write(`${c.yellow}Warning: ${needsEmbedding} documents (${pct}%) need embeddings. Run 'straja-vault embed' for better results.${c.reset}\n`);
+    } else {
+      process.stderr.write(`${c.dim}Tip: ${needsEmbedding} documents need embeddings. Run 'straja-vault embed' to index them.${c.reset}\n`);
+    }
+  }
+
+  // Check if most recent document update is older than 2 weeks
+  if (daysStale !== null && daysStale >= 14) {
+    process.stderr.write(`${c.dim}Tip: Index last updated ${daysStale} days ago. Run 'straja-vault update' to refresh.${c.reset}\n`);
+  }
+}
+
+// Compute unique display path for a document
+// Always include at least parent folder + filename, add more parent dirs until unique
+function computeDisplayPath(
+  filepath: string,
+  collectionPath: string,
+  existingPaths: Set<string>
+): string {
+  // Get path relative to collection (include collection dir name)
+  const collectionDir = collectionPath.replace(/\/$/, '');
+  const collectionName = collectionDir.split('/').pop() || '';
+
+  let relativePath: string;
+  if (filepath.startsWith(collectionDir + '/')) {
+    // filepath is under collection: use collection name + relative path
+    relativePath = collectionName + filepath.slice(collectionDir.length);
+  } else {
+    // Fallback: just use the filepath
+    relativePath = filepath;
+  }
+
+  const parts = relativePath.split('/').filter(p => p.length > 0);
+
+  // Always include at least parent folder + filename (minimum 2 parts if available)
+  // Then add more parent dirs until unique
+  const minParts = Math.min(2, parts.length);
+  for (let i = parts.length - minParts; i >= 0; i--) {
+    const candidate = parts.slice(i).join('/');
+    if (!existingPaths.has(candidate)) {
+      return candidate;
+    }
+  }
+
+  // Absolute fallback: use full path (should be unique)
+  return filepath;
+}
+
+
+function formatTimeAgo(date: Date): string {
+  const seconds = Math.floor((Date.now() - date.getTime()) / 1000);
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
+}
+
+function formatMs(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  return `${(ms / 1000).toFixed(1)}s`;
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+}
+
+async function showStatus(): Promise<void> {
+  const dbPath = getDbPath();
+  const db = getDb();
+
+  // Collections are defined in YAML; no duplicate cleanup needed.
+  // Collections are defined in YAML; no duplicate cleanup needed.
+
+  // Index size
+  let indexSize = 0;
+  try {
+    const stat = statSync(dbPath).size;
+    indexSize = stat;
+  } catch { }
+
+  // Collections info (from YAML + database stats)
+  const collections = listCollections(db);
+
+  // Overall stats
+  const totalDocs = db.prepare(`SELECT COUNT(*) as count FROM documents WHERE active = 1`).get() as { count: number };
+  const vectorCount = db.prepare(`SELECT COUNT(*) as count FROM content_vectors`).get() as { count: number };
+  const needsEmbedding = getHashesNeedingEmbedding(db);
+
+  // Most recent update across all collections
+  const mostRecent = db.prepare(`SELECT MAX(modified_at) as latest FROM documents WHERE active = 1`).get() as { latest: string | null };
+
+  console.log(`${c.bold}Straja Vault Status${c.reset}\n`);
+  console.log(`Index: ${dbPath}`);
+  console.log(`Size:  ${formatBytes(indexSize)}`);
+
+  // MCP daemon status (check PID file liveness)
+  const mcpCacheDir = process.env.XDG_CACHE_HOME
+    ? resolve(process.env.XDG_CACHE_HOME, "straja-vault")
+    : resolve(homedir(), ".cache", "straja-vault");
+  const mcpPidPath = resolve(mcpCacheDir, "mcp.pid");
+  if (existsSync(mcpPidPath)) {
+    const mcpPid = parseInt(readFileSync(mcpPidPath, "utf-8").trim());
+    try {
+      process.kill(mcpPid, 0);
+      console.log(`MCP:   ${c.green}running${c.reset} (PID ${mcpPid})`);
+    } catch {
+      unlinkSync(mcpPidPath);
+      // Stale PID file cleaned up silently
+    }
+  }
+  console.log("");
+
+  console.log(`${c.bold}Documents${c.reset}`);
+  console.log(`  Total:    ${totalDocs.count} files indexed`);
+  console.log(`  Vectors:  ${vectorCount.count} embedded`);
+  if (needsEmbedding > 0) {
+    console.log(`  ${c.yellow}Pending:  ${needsEmbedding} need embedding${c.reset} (run 'straja-vault embed')`);
+  }
+  if (mostRecent.latest) {
+    const lastUpdate = new Date(mostRecent.latest);
+    console.log(`  Updated:  ${formatTimeAgo(lastUpdate)}`);
+  }
+
+  // Get all contexts grouped by collection (from YAML)
+  const allContexts = listAllContexts();
+  const contextsByCollection = new Map<string, { path_prefix: string; context: string }[]>();
+
+  for (const ctx of allContexts) {
+    // Group contexts by collection name
+    if (!contextsByCollection.has(ctx.collection)) {
+      contextsByCollection.set(ctx.collection, []);
+    }
+    contextsByCollection.get(ctx.collection)!.push({
+      path_prefix: ctx.path,
+      context: ctx.context
+    });
+  }
+
+  if (collections.length > 0) {
+    console.log(`\n${c.bold}Collections${c.reset}`);
+    for (const col of collections) {
+      const lastMod = col.last_modified ? formatTimeAgo(new Date(col.last_modified)) : "never";
+      const contexts = contextsByCollection.get(col.name) || [];
+
+      console.log(`  ${c.cyan}${col.name}${c.reset} ${c.dim}(vault://${col.name}/)${c.reset}`);
+      console.log(`    ${c.dim}Pattern:${c.reset}  ${col.glob_pattern}`);
+      console.log(`    ${c.dim}Files:${c.reset}    ${col.active_count} (updated ${lastMod})`);
+
+      if (contexts.length > 0) {
+        console.log(`    ${c.dim}Contexts:${c.reset} ${contexts.length}`);
+        for (const ctx of contexts) {
+          // Handle both empty string and '/' as root context
+          const pathDisplay = (ctx.path_prefix === '' || ctx.path_prefix === '/') ? '/' : `/${ctx.path_prefix}`;
+          const contextPreview = ctx.context.length > 60
+            ? ctx.context.substring(0, 57) + '...'
+            : ctx.context;
+          console.log(`      ${c.dim}${pathDisplay}:${c.reset} ${contextPreview}`);
+        }
+      }
+    }
+
+    // Show examples of virtual paths
+    console.log(`\n${c.bold}Examples${c.reset}`);
+    console.log(`  ${c.dim}# List files in a collection${c.reset}`);
+    if (collections.length > 0 && collections[0]) {
+      console.log(`  straja-vault ls ${collections[0].name}`);
+    }
+    console.log(`  ${c.dim}# Get a document${c.reset}`);
+    if (collections.length > 0 && collections[0]) {
+      console.log(`  straja-vault get vault://${collections[0].name}/path/to/file.md`);
+    }
+    console.log(`  ${c.dim}# Search within a collection${c.reset}`);
+    if (collections.length > 0 && collections[0]) {
+      console.log(`  straja-vault search "query" -c ${collections[0].name}`);
+    }
+  } else {
+    console.log(`\n${c.dim}No collections. Run 'straja-vault collection add .' to index markdown files.${c.reset}`);
+  }
+
+  // Models
+  {
+    // hf:org/repo/file.gguf → https://huggingface.co/org/repo
+    const hfLink = (uri: string) => {
+      const match = uri.match(/^hf:([^/]+\/[^/]+)\//);
+      return match ? `https://huggingface.co/${match[1]}` : uri;
+    };
+    console.log(`\n${c.bold}Models${c.reset}`);
+    console.log(`  Embedding:   ${hfLink(DEFAULT_EMBED_MODEL_URI)}`);
+    console.log(`  Reranking:   ${hfLink(DEFAULT_RERANK_MODEL_URI)}`);
+    console.log(`  Generation:  ${hfLink(DEFAULT_GENERATE_MODEL_URI)}`);
+  }
+
+  // Device / GPU info
+  try {
+    const llm = getDefaultLlamaCpp();
+    const device = await llm.getDeviceInfo();
+    console.log(`\n${c.bold}Device${c.reset}`);
+    if (device.gpu) {
+      console.log(`  GPU:      ${c.green}${device.gpu}${c.reset} (offloading: ${device.gpuOffloading ? 'yes' : 'no'})`);
+      if (device.gpuDevices.length > 0) {
+        // Deduplicate and count GPUs
+        const counts = new Map<string, number>();
+        for (const name of device.gpuDevices) {
+          counts.set(name, (counts.get(name) || 0) + 1);
+        }
+        const deviceStr = Array.from(counts.entries())
+          .map(([name, count]) => count > 1 ? `${count}× ${name}` : name)
+          .join(', ');
+        console.log(`  Devices:  ${deviceStr}`);
+      }
+      if (device.vram) {
+        console.log(`  VRAM:     ${formatBytes(device.vram.free)} free / ${formatBytes(device.vram.total)} total`);
+      }
+    } else {
+      console.log(`  GPU:      ${c.yellow}none${c.reset} (running on CPU — models will be slow)`);
+      console.log(`  ${c.dim}Tip: Install CUDA, Vulkan, or Metal support for GPU acceleration.${c.reset}`);
+    }
+    console.log(`  CPU:      ${device.cpuCores} math cores`);
+  } catch {
+    // Don't fail status if LLM init fails
+  }
+
+  // Tips section
+  const tips: string[] = [];
+
+  // Check for collections without context
+  const collectionsWithoutContext = collections.filter(col => {
+    const contexts = contextsByCollection.get(col.name) || [];
+    return contexts.length === 0;
+  });
+  if (collectionsWithoutContext.length > 0) {
+    const names = collectionsWithoutContext.map(c => c.name).slice(0, 3).join(', ');
+    const more = collectionsWithoutContext.length > 3 ? ` +${collectionsWithoutContext.length - 3} more` : '';
+    tips.push(`Add context to collections for better search results: ${names}${more}`);
+    tips.push(`  ${c.dim}straja-vault context add vault://<name>/ "What this collection contains"${c.reset}`);
+    tips.push(`  ${c.dim}straja-vault context add vault://<name>/meeting-notes "Weekly team meeting notes"${c.reset}`);
+  }
+
+  // Check for collections without update commands
+  const collectionsWithoutUpdate = collections.filter(col => {
+    const yamlCol = getCollectionFromYaml(col.name);
+    return !yamlCol?.update;
+  });
+  if (collectionsWithoutUpdate.length > 0 && collections.length > 1) {
+    const names = collectionsWithoutUpdate.map(c => c.name).slice(0, 3).join(', ');
+    const more = collectionsWithoutUpdate.length > 3 ? ` +${collectionsWithoutUpdate.length - 3} more` : '';
+    tips.push(`Add update commands to keep collections fresh: ${names}${more}`);
+    tips.push(`  ${c.dim}straja-vault collection update-cmd <name> 'git stash && git pull --rebase --ff-only && git stash pop'${c.reset}`);
+  }
+
+  if (tips.length > 0) {
+    console.log(`\n${c.bold}Tips${c.reset}`);
+    for (const tip of tips) {
+      console.log(`  ${tip}`);
+    }
+  }
+
+  closeDb();
+}
+
+async function updateCollections(): Promise<void> {
+  const db = getDb();
+  // Collections are defined in YAML; no duplicate cleanup needed.
+
+  // Clear Ollama cache on update
+  clearCache(db);
+
+  const collections = listCollections(db);
+
+  if (collections.length === 0) {
+    console.log(`${c.dim}No collections found. Run 'straja-vault collection add .' to index markdown files.${c.reset}`);
+    closeDb();
+    return;
+  }
+
+  // Don't close db here - indexFiles will reuse it and close at the end
+  console.log(`${c.bold}Updating ${collections.length} collection(s)...${c.reset}\n`);
+
+  for (let i = 0; i < collections.length; i++) {
+    const col = collections[i];
+    if (!col) continue;
+    if (col.name === "_uploads" || col.name === "_screenshots") {
+      console.log(`${c.cyan}[${i + 1}/${collections.length}]${c.reset} ${c.bold}${col.name}${c.reset} ${c.dim}(raw browser storage, skipped)${c.reset}`);
+      console.log("");
+      continue;
+    }
+    console.log(`${c.cyan}[${i + 1}/${collections.length}]${c.reset} ${c.bold}${col.name}${c.reset} ${c.dim}(${col.glob_pattern})${c.reset}`);
+
+    // Execute custom update command if specified in YAML
+    const yamlCol = getCollectionFromYaml(col.name);
+    if (yamlCol?.update) {
+      console.log(`${c.dim}    Running update command: ${yamlCol.update}${c.reset}`);
+      try {
+        const proc = nodeSpawn("bash", ["-c", yamlCol.update], {
+          cwd: col.pwd,
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+
+        const [output, errorOutput, exitCode] = await new Promise<[string, string, number]>((resolve, reject) => {
+          let out = "";
+          let err = "";
+          proc.stdout?.on("data", (d: Buffer) => { out += d.toString(); });
+          proc.stderr?.on("data", (d: Buffer) => { err += d.toString(); });
+          proc.on("error", reject);
+          proc.on("close", (code) => resolve([out, err, code ?? 1]));
+        });
+
+        if (output.trim()) {
+          console.log(output.trim().split('\n').map(l => `    ${l}`).join('\n'));
+        }
+        if (errorOutput.trim()) {
+          console.log(errorOutput.trim().split('\n').map(l => `    ${l}`).join('\n'));
+        }
+
+        if (exitCode !== 0) {
+          console.log(`${c.yellow}✗ Update command failed with exit code ${exitCode}${c.reset}`);
+          process.exit(exitCode);
+        }
+      } catch (err) {
+        console.log(`${c.yellow}✗ Update command failed: ${err}${c.reset}`);
+        process.exit(1);
+      }
+    }
+
+    await indexFiles(col.pwd, col.glob_pattern, col.name, true);
+    console.log("");
+  }
+
+  // Check if any documents need embedding (show once at end)
+  const finalDb = getDb();
+  const needsEmbedding = getHashesNeedingEmbedding(finalDb);
+  closeDb();
+
+  console.log(`${c.green}✓ All collections updated.${c.reset}`);
+  if (needsEmbedding > 0) {
+    console.log(`\nRun 'straja-vault embed' to update embeddings (${needsEmbedding} unique hashes need vectors)`);
+  }
+}
+
+/**
+ * Detect which collection (if any) contains the given filesystem path.
+ * Returns { collectionId, collectionName, relativePath } or null if not in any collection.
+ */
+function detectCollectionFromPath(db: Database, fsPath: string): { collectionName: string; relativePath: string } | null {
+  const realPath = getRealPath(fsPath);
+
+  // Find collections that this path is under from YAML
+  const allCollections = yamlListCollections();
+
+  // Find longest matching path
+  let bestMatch: { name: string; path: string } | null = null;
+  for (const coll of allCollections) {
+    if (realPath.startsWith(coll.path + '/') || realPath === coll.path) {
+      if (!bestMatch || coll.path.length > bestMatch.path.length) {
+        bestMatch = { name: coll.name, path: coll.path };
+      }
+    }
+  }
+
+  if (!bestMatch) return null;
+
+  // Calculate relative path
+  let relativePath = realPath;
+  if (relativePath.startsWith(bestMatch.path + '/')) {
+    relativePath = relativePath.slice(bestMatch.path.length + 1);
+  } else if (relativePath === bestMatch.path) {
+    relativePath = '';
+  }
+
+  return {
+    collectionName: bestMatch.name,
+    relativePath
+  };
+}
+
+async function contextAdd(pathArg: string | undefined, contextText: string): Promise<void> {
+  const db = getDb();
+
+  // Handle "/" as global context (applies to all collections)
+  if (pathArg === '/') {
+    setGlobalContext(contextText);
+    console.log(`${c.green}✓${c.reset} Set global context`);
+    console.log(`${c.dim}Context: ${contextText}${c.reset}`);
+    closeDb();
+    return;
+  }
+
+  // Resolve path - defaults to current directory if not provided
+  let fsPath = pathArg || '.';
+  if (fsPath === '.' || fsPath === './') {
+    fsPath = getPwd();
+  } else if (fsPath.startsWith('~/')) {
+    fsPath = homedir() + fsPath.slice(1);
+  } else if (!fsPath.startsWith('/') && !fsPath.startsWith('vault://')) {
+    fsPath = resolve(getPwd(), fsPath);
+  }
+
+  // Handle virtual paths (vault://collection/path)
+  if (isVirtualPath(fsPath)) {
+    const parsed = parseVirtualPath(fsPath);
+    if (!parsed) {
+      console.error(`${c.yellow}Invalid virtual path: ${fsPath}${c.reset}`);
+      process.exit(1);
+    }
+
+    const coll = getCollectionFromYaml(parsed.collectionName);
+    if (!coll) {
+      console.error(`${c.yellow}Collection not found: ${parsed.collectionName}${c.reset}`);
+      process.exit(1);
+    }
+
+    yamlAddContext(parsed.collectionName, parsed.path, contextText);
+
+    const displayPath = parsed.path
+      ? `vault://${parsed.collectionName}/${parsed.path}`
+      : `vault://${parsed.collectionName}/ (collection root)`;
+    console.log(`${c.green}✓${c.reset} Added context for: ${displayPath}`);
+    console.log(`${c.dim}Context: ${contextText}${c.reset}`);
+    closeDb();
+    return;
+  }
+
+  // Detect collection from filesystem path
+  const detected = detectCollectionFromPath(db, fsPath);
+  if (!detected) {
+    console.error(`${c.yellow}Path is not in any indexed collection: ${fsPath}${c.reset}`);
+    console.error(`${c.dim}Run 'straja-vault status' to see indexed collections${c.reset}`);
+    process.exit(1);
+  }
+
+  yamlAddContext(detected.collectionName, detected.relativePath, contextText);
+
+  const displayPath = detected.relativePath ? `vault://${detected.collectionName}/${detected.relativePath}` : `vault://${detected.collectionName}/`;
+  console.log(`${c.green}✓${c.reset} Added context for: ${displayPath}`);
+  console.log(`${c.dim}Context: ${contextText}${c.reset}`);
+  closeDb();
+}
+
+function contextList(): void {
+  const db = getDb();
+
+  const allContexts = listAllContexts();
+
+  if (allContexts.length === 0) {
+    console.log(`${c.dim}No contexts configured. Use 'straja-vault context add' to add one.${c.reset}`);
+    closeDb();
+    return;
+  }
+
+  console.log(`\n${c.bold}Configured Contexts${c.reset}\n`);
+
+  let lastCollection = '';
+  for (const ctx of allContexts) {
+    if (ctx.collection !== lastCollection) {
+      console.log(`${c.cyan}${ctx.collection}${c.reset}`);
+      lastCollection = ctx.collection;
+    }
+
+    const displayPath = ctx.path ? `  ${ctx.path}` : '  / (root)';
+    console.log(`${displayPath}`);
+    console.log(`    ${c.dim}${ctx.context}${c.reset}`);
+  }
+
+  closeDb();
+}
+
+function contextRemove(pathArg: string): void {
+  if (pathArg === '/') {
+    // Remove global context
+    setGlobalContext(undefined);
+    console.log(`${c.green}✓${c.reset} Removed global context`);
+    return;
+  }
+
+  // Handle virtual paths
+  if (isVirtualPath(pathArg)) {
+    const parsed = parseVirtualPath(pathArg);
+    if (!parsed) {
+      console.error(`${c.yellow}Invalid virtual path: ${pathArg}${c.reset}`);
+      process.exit(1);
+    }
+
+    const coll = getCollectionFromYaml(parsed.collectionName);
+    if (!coll) {
+      console.error(`${c.yellow}Collection not found: ${parsed.collectionName}${c.reset}`);
+      process.exit(1);
+    }
+
+    const success = yamlRemoveContext(coll.name, parsed.path);
+
+    if (!success) {
+      console.error(`${c.yellow}No context found for: ${pathArg}${c.reset}`);
+      process.exit(1);
+    }
+
+    console.log(`${c.green}✓${c.reset} Removed context for: ${pathArg}`);
+    return;
+  }
+
+  // Handle filesystem paths
+  let fsPath = pathArg;
+  if (fsPath === '.' || fsPath === './') {
+    fsPath = getPwd();
+  } else if (fsPath.startsWith('~/')) {
+    fsPath = homedir() + fsPath.slice(1);
+  } else if (!fsPath.startsWith('/')) {
+    fsPath = resolve(getPwd(), fsPath);
+  }
+
+  const db = getDb();
+  const detected = detectCollectionFromPath(db, fsPath);
+  closeDb();
+
+  if (!detected) {
+    console.error(`${c.yellow}Path is not in any indexed collection: ${fsPath}${c.reset}`);
+    process.exit(1);
+  }
+
+  const success = yamlRemoveContext(detected.collectionName, detected.relativePath);
+
+  if (!success) {
+    console.error(`${c.yellow}No context found for: vault://${detected.collectionName}/${detected.relativePath}${c.reset}`);
+    process.exit(1);
+  }
+
+  console.log(`${c.green}✓${c.reset} Removed context for: vault://${detected.collectionName}/${detected.relativePath}`);
+}
+
+function getDocument(filename: string, fromLine?: number, maxLines?: number, lineNumbers?: boolean): void {
+  const db = getDb();
+
+  // Parse :linenum suffix from filename (e.g., "file.md:100")
+  let inputPath = filename;
+  const colonMatch = inputPath.match(/:(\d+)$/);
+  if (colonMatch && !fromLine) {
+    const matched = colonMatch[1];
+    if (matched) {
+      fromLine = parseInt(matched, 10);
+      inputPath = inputPath.slice(0, -colonMatch[0].length);
+    }
+  }
+
+  // Handle docid lookup (#abc123, abc123, "#abc123", "abc123", etc.)
+  if (isDocid(inputPath)) {
+    const docidMatch = findDocumentByDocid(db, inputPath);
+    if (docidMatch) {
+      inputPath = docidMatch.filepath;
+    } else {
+      console.error(`Document not found: ${filename}`);
+      closeDb();
+      process.exit(1);
+    }
+  }
+
+  let doc: { collectionName: string; path: string; body: string } | null = null;
+  let virtualPath: string;
+
+  // Handle virtual paths (vault://collection/path)
+  if (isVirtualPath(inputPath)) {
+    const parsed = parseVirtualPath(inputPath);
+    if (!parsed) {
+      console.error(`Invalid virtual path: ${inputPath}`);
+      closeDb();
+      process.exit(1);
+    }
+
+    // Try exact match on collection + path
+    doc = db.prepare(`
+      SELECT d.collection as collectionName, d.path, content.doc as body
+      FROM documents d
+      JOIN content ON content.hash = d.hash
+      WHERE d.collection = ? AND d.path = ? AND d.active = 1
+    `).get(parsed.collectionName, parsed.path) as typeof doc;
+
+    if (!doc) {
+      // Try fuzzy match by path ending
+      doc = db.prepare(`
+        SELECT d.collection as collectionName, d.path, content.doc as body
+        FROM documents d
+        JOIN content ON content.hash = d.hash
+        WHERE d.collection = ? AND d.path LIKE ? AND d.active = 1
+        LIMIT 1
+      `).get(parsed.collectionName, `%${parsed.path}`) as typeof doc;
+    }
+
+    virtualPath = inputPath;
+  } else {
+    // Try to interpret as collection/path format first (before filesystem path)
+    // If path is relative (no / or ~ prefix), check if first component is a collection name
+    if (!inputPath.startsWith('/') && !inputPath.startsWith('~')) {
+      const parts = inputPath.split('/');
+      if (parts.length >= 2) {
+        const possibleCollection = parts[0];
+        const possiblePath = parts.slice(1).join('/');
+
+        // Check if this collection exists
+        const collExists = possibleCollection ? db.prepare(`
+          SELECT 1 FROM documents WHERE collection = ? AND active = 1 LIMIT 1
+        `).get(possibleCollection) : null;
+
+        if (collExists) {
+          // Try exact match on collection + path
+          doc = db.prepare(`
+            SELECT d.collection as collectionName, d.path, content.doc as body
+            FROM documents d
+            JOIN content ON content.hash = d.hash
+            WHERE d.collection = ? AND d.path = ? AND d.active = 1
+          `).get(possibleCollection || "", possiblePath || "") as { collectionName: string; path: string; body: string } | null;
+
+          if (!doc) {
+            // Try fuzzy match by path ending
+            doc = db.prepare(`
+              SELECT d.collection as collectionName, d.path, content.doc as body
+              FROM documents d
+              JOIN content ON content.hash = d.hash
+              WHERE d.collection = ? AND d.path LIKE ? AND d.active = 1
+              LIMIT 1
+            `).get(possibleCollection || "", `%${possiblePath}`) as { collectionName: string; path: string; body: string } | null;
+          }
+
+          if (doc) {
+            virtualPath = buildVirtualPath(doc.collectionName, doc.path);
+            // Skip the filesystem path handling below
+          }
+        }
+      }
+    }
+
+    // If not found as collection/path, handle as filesystem paths
+    if (!doc) {
+      let fsPath = inputPath;
+
+      // Expand ~ to home directory
+      if (fsPath.startsWith('~/')) {
+        fsPath = homedir() + fsPath.slice(1);
+      } else if (!fsPath.startsWith('/')) {
+        // Relative path - resolve from current directory
+        fsPath = resolve(getPwd(), fsPath);
+      }
+      fsPath = getRealPath(fsPath);
+
+      // Try to detect which collection contains this path
+      const detected = detectCollectionFromPath(db, fsPath);
+
+      if (detected) {
+        // Found collection - query by collection name + relative path
+        doc = db.prepare(`
+          SELECT d.collection as collectionName, d.path, content.doc as body
+          FROM documents d
+          JOIN content ON content.hash = d.hash
+          WHERE d.collection = ? AND d.path = ? AND d.active = 1
+        `).get(detected.collectionName, detected.relativePath) as { collectionName: string; path: string; body: string } | null;
+      }
+
+      // Fuzzy match by filename (last component of path)
+      if (!doc) {
+        const filename = inputPath.split('/').pop() || inputPath;
+        doc = db.prepare(`
+          SELECT d.collection as collectionName, d.path, content.doc as body
+          FROM documents d
+          JOIN content ON content.hash = d.hash
+          WHERE d.path LIKE ? AND d.active = 1
+          LIMIT 1
+        `).get(`%${filename}`) as { collectionName: string; path: string; body: string } | null;
+      }
+
+      if (doc) {
+        virtualPath = buildVirtualPath(doc.collectionName, doc.path);
+      } else {
+        virtualPath = inputPath;
+      }
+    }
+  }
+
+  // Ensure doc is not null before proceeding
+  if (!doc) {
+    console.error(`Document not found: ${filename}`);
+    closeDb();
+    process.exit(1);
+  }
+
+  // Get context for this file
+  const context = getContextForPath(db, doc.collectionName, doc.path);
+
+  let output = doc.body;
+  const startLine = fromLine || 1;
+
+  // Apply line filtering if specified
+  if (fromLine !== undefined || maxLines !== undefined) {
+    const lines = output.split('\n');
+    const start = startLine - 1; // Convert to 0-indexed
+    const end = maxLines !== undefined ? start + maxLines : lines.length;
+    output = lines.slice(start, end).join('\n');
+  }
+
+  // Add line numbers if requested
+  if (lineNumbers) {
+    output = addLineNumbers(output, startLine);
+  }
+
+  // Output context header if exists
+  if (context) {
+    console.log(`Folder Context: ${context}\n---\n`);
+  }
+  console.log(output);
+  closeDb();
+}
+
+// Multi-get: fetch multiple documents by glob pattern or comma-separated list
+function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT_MULTI_GET_MAX_BYTES, format: OutputFormat = "cli"): void {
+  const db = getDb();
+
+  // Check if it's a comma-separated list or a glob pattern
+  const isCommaSeparated = pattern.includes(',') && !pattern.includes('*') && !pattern.includes('?');
+
+  let files: { filepath: string; displayPath: string; bodyLength: number; collection?: string; path?: string }[];
+
+  if (isCommaSeparated) {
+    // Comma-separated list of files (can be virtual paths or relative paths)
+    const names = pattern.split(',').map(s => s.trim()).filter(Boolean);
+    files = [];
+    for (const name of names) {
+      let doc: { virtual_path: string; body_length: number; collection: string; path: string } | null = null;
+
+      // Handle virtual paths
+      if (isVirtualPath(name)) {
+        const parsed = parseVirtualPath(name);
+        if (parsed) {
+          // Try exact match on collection + path
+          doc = db.prepare(`
+            SELECT
+              'vault://' || d.collection || '/' || d.path as virtual_path,
+              LENGTH(content.doc) as body_length,
+              d.collection,
+              d.path
+            FROM documents d
+            JOIN content ON content.hash = d.hash
+            WHERE d.collection = ? AND d.path = ? AND d.active = 1
+          `).get(parsed.collectionName, parsed.path) as typeof doc;
+        }
+      } else {
+        // Try exact match on path
+        doc = db.prepare(`
+          SELECT
+            'vault://' || d.collection || '/' || d.path as virtual_path,
+            LENGTH(content.doc) as body_length,
+            d.collection,
+            d.path
+          FROM documents d
+          JOIN content ON content.hash = d.hash
+          WHERE d.path = ? AND d.active = 1
+          LIMIT 1
+        `).get(name) as { virtual_path: string; body_length: number; collection: string; path: string } | null;
+
+        // Try suffix match
+        if (!doc) {
+          doc = db.prepare(`
+            SELECT
+              'vault://' || d.collection || '/' || d.path as virtual_path,
+              LENGTH(content.doc) as body_length,
+              d.collection,
+              d.path
+            FROM documents d
+            JOIN content ON content.hash = d.hash
+            WHERE d.path LIKE ? AND d.active = 1
+            LIMIT 1
+          `).get(`%${name}`) as { virtual_path: string; body_length: number; collection: string; path: string } | null;
+        }
+      }
+
+      if (doc) {
+        files.push({
+          filepath: doc.virtual_path,
+          displayPath: doc.virtual_path,
+          bodyLength: doc.body_length,
+          collection: doc.collection,
+          path: doc.path
+        });
+      } else {
+        console.error(`File not found: ${name}`);
+      }
+    }
+  } else {
+    // Glob pattern - matchFilesByGlob now returns virtual paths
+    files = matchFilesByGlob(db, pattern).map(f => ({
+      ...f,
+      collection: undefined,  // Will be fetched later if needed
+      path: undefined
+    }));
+    if (files.length === 0) {
+      console.error(`No files matched pattern: ${pattern}`);
+      closeDb();
+      process.exit(1);
+    }
+  }
+
+  // Collect results for structured output
+  const results: { file: string; displayPath: string; title: string; body: string; context: string | null; skipped: boolean; skipReason?: string }[] = [];
+
+  for (const file of files) {
+    // Parse virtual path to get collection info if not already available
+    let collection = file.collection;
+    let path = file.path;
+
+    if (!collection || !path) {
+      const parsed = parseVirtualPath(file.filepath);
+      if (parsed) {
+        collection = parsed.collectionName;
+        path = parsed.path;
+      }
+    }
+
+    // Get context using collection-scoped function
+    const context = collection && path ? getContextForPath(db, collection, path) : null;
+
+    // Check size limit
+    if (file.bodyLength > maxBytes) {
+      results.push({
+        file: file.filepath,
+        displayPath: file.displayPath,
+        title: file.displayPath.split('/').pop() || file.displayPath,
+        body: "",
+        context,
+        skipped: true,
+        skipReason: `File too large (${Math.round(file.bodyLength / 1024)}KB > ${Math.round(maxBytes / 1024)}KB). Use 'straja-vault get ${file.displayPath}' to retrieve.`,
+      });
+      continue;
+    }
+
+    // Fetch document content using collection and path
+    if (!collection || !path) continue;
+
+    const doc = db.prepare(`
+      SELECT content.doc as body, d.title
+      FROM documents d
+      JOIN content ON content.hash = d.hash
+      WHERE d.collection = ? AND d.path = ? AND d.active = 1
+    `).get(collection, path) as { body: string; title: string } | null;
+
+    if (!doc) continue;
+
+    let body = doc.body;
+
+    // Apply line limit if specified
+    if (maxLines !== undefined) {
+      const lines = body.split('\n');
+      body = lines.slice(0, maxLines).join('\n');
+      if (lines.length > maxLines) {
+        body += `\n\n[... truncated ${lines.length - maxLines} more lines]`;
+      }
+    }
+
+    results.push({
+      file: file.filepath,
+      displayPath: file.displayPath,
+      title: doc.title || file.displayPath.split('/').pop() || file.displayPath,
+      body,
+      context,
+      skipped: false,
+    });
+  }
+
+  closeDb();
+
+  // Output based on format
+  if (format === "json") {
+    const output = results.map(r => ({
+      file: r.displayPath,
+      title: r.title,
+      ...(r.context && { context: r.context }),
+      ...(r.skipped ? { skipped: true, reason: r.skipReason } : { body: r.body }),
+    }));
+    console.log(JSON.stringify(output, null, 2));
+  } else if (format === "csv") {
+    const escapeField = (val: string | null | undefined): string => {
+      if (val === null || val === undefined) return "";
+      const str = String(val);
+      if (str.includes(",") || str.includes('"') || str.includes("\n")) {
+        return `"${str.replace(/"/g, '""')}"`;
+      }
+      return str;
+    };
+    console.log("file,title,context,skipped,body");
+    for (const r of results) {
+      console.log([r.displayPath, r.title, r.context, r.skipped ? "true" : "false", r.skipped ? r.skipReason : r.body].map(escapeField).join(","));
+    }
+  } else if (format === "files") {
+    for (const r of results) {
+      const ctx = r.context ? `,"${r.context.replace(/"/g, '""')}"` : "";
+      const status = r.skipped ? "[SKIPPED]" : "";
+      console.log(`${r.displayPath}${ctx}${status ? `,${status}` : ""}`);
+    }
+  } else if (format === "md") {
+    for (const r of results) {
+      console.log(`## ${r.displayPath}\n`);
+      if (r.title && r.title !== r.displayPath) console.log(`**Title:** ${r.title}\n`);
+      if (r.context) console.log(`**Context:** ${r.context}\n`);
+      if (r.skipped) {
+        console.log(`> ${r.skipReason}\n`);
+      } else {
+        console.log("```");
+        console.log(r.body);
+        console.log("```\n");
+      }
+    }
+  } else if (format === "xml") {
+    console.log('<?xml version="1.0" encoding="UTF-8"?>');
+    console.log("<documents>");
+    for (const r of results) {
+      console.log("  <document>");
+      console.log(`    <file>${escapeXml(r.displayPath)}</file>`);
+      console.log(`    <title>${escapeXml(r.title)}</title>`);
+      if (r.context) console.log(`    <context>${escapeXml(r.context)}</context>`);
+      if (r.skipped) {
+        console.log(`    <skipped>true</skipped>`);
+        console.log(`    <reason>${escapeXml(r.skipReason || "")}</reason>`);
+      } else {
+        console.log(`    <body>${escapeXml(r.body)}</body>`);
+      }
+      console.log("  </document>");
+    }
+    console.log("</documents>");
+  } else {
+    // CLI format (default)
+    for (const r of results) {
+      console.log(`\n${'='.repeat(60)}`);
+      console.log(`File: ${r.displayPath}`);
+      console.log(`${'='.repeat(60)}\n`);
+
+      if (r.skipped) {
+        console.log(`[SKIPPED: ${r.skipReason}]`);
+        continue;
+      }
+
+      if (r.context) {
+        console.log(`Folder Context: ${r.context}\n---\n`);
+      }
+      console.log(r.body);
+    }
+  }
+}
+
+// List files in virtual file tree
+function listFiles(pathArg?: string): void {
+  const db = getDb();
+
+  if (!pathArg) {
+    // No argument - list all collections
+    const yamlCollections = yamlListCollections();
+
+    if (yamlCollections.length === 0) {
+      console.log("No collections found. Run 'straja-vault collection add .' to index files.");
+      closeDb();
+      return;
+    }
+
+    // Get file counts from database for each collection
+    const collections = yamlCollections.map(coll => {
+      const stats = db.prepare(`
+        SELECT COUNT(*) as file_count
+        FROM documents d
+        WHERE d.collection = ? AND d.active = 1
+      `).get(coll.name) as { file_count: number } | null;
+
+      return {
+        name: coll.name,
+        file_count: stats?.file_count || 0
+      };
+    });
+
+    console.log(`${c.bold}Collections:${c.reset}\n`);
+    for (const coll of collections) {
+      console.log(`  ${c.dim}vault://${c.reset}${c.cyan}${coll.name}/${c.reset}  ${c.dim}(${coll.file_count} files)${c.reset}`);
+    }
+    closeDb();
+    return;
+  }
+
+  // Parse the path argument
+  let collectionName: string;
+  let pathPrefix: string | null = null;
+
+  if (pathArg.startsWith('vault://')) {
+    // Virtual path format: vault://collection/path
+    const parsed = parseVirtualPath(pathArg);
+    if (!parsed) {
+      console.error(`Invalid virtual path: ${pathArg}`);
+      closeDb();
+      process.exit(1);
+    }
+    collectionName = parsed.collectionName;
+    pathPrefix = parsed.path;
+  } else {
+    // Just collection name or collection/path
+    const parts = pathArg.split('/');
+    collectionName = parts[0] || '';
+    if (parts.length > 1) {
+      pathPrefix = parts.slice(1).join('/');
+    }
+  }
+
+  // Get the collection
+  const coll = getCollectionFromYaml(collectionName);
+  if (!coll) {
+    console.error(`Collection not found: ${collectionName}`);
+    console.error(`Run 'straja-vault ls' to see available collections.`);
+    closeDb();
+    process.exit(1);
+  }
+
+  // List files in the collection with size and modification time
+  let query: string;
+  let params: any[];
+
+  if (pathPrefix) {
+    // List files under a specific path
+    query = `
+      SELECT d.path, d.title, d.modified_at, LENGTH(ct.doc) as size
+      FROM documents d
+      JOIN content ct ON d.hash = ct.hash
+      WHERE d.collection = ? AND d.path LIKE ? AND d.active = 1
+      ORDER BY d.path
+    `;
+    params = [coll.name, `${pathPrefix}%`];
+  } else {
+    // List all files in the collection
+    query = `
+      SELECT d.path, d.title, d.modified_at, LENGTH(ct.doc) as size
+      FROM documents d
+      JOIN content ct ON d.hash = ct.hash
+      WHERE d.collection = ? AND d.active = 1
+      ORDER BY d.path
+    `;
+    params = [coll.name];
+  }
+
+  const files = db.prepare(query).all(...params) as { path: string; title: string; modified_at: string; size: number }[];
+
+  if (files.length === 0) {
+    if (pathPrefix) {
+      console.log(`No files found under vault://${collectionName}/${pathPrefix}`);
+    } else {
+      console.log(`No files found in collection: ${collectionName}`);
+    }
+    closeDb();
+    return;
+  }
+
+  // Calculate max widths for alignment
+  const maxSize = Math.max(...files.map(f => formatBytes(f.size).length));
+
+  // Output in ls -l style
+  for (const file of files) {
+    const sizeStr = formatBytes(file.size).padStart(maxSize);
+    const date = new Date(file.modified_at);
+    const timeStr = formatLsTime(date);
+
+    // Dim the vault:// prefix, highlight the filename
+    console.log(`${sizeStr}  ${timeStr}  ${c.dim}vault://${collectionName}/${c.reset}${c.cyan}${file.path}${c.reset}`);
+  }
+
+  closeDb();
+}
+
+// Format date/time like ls -l
+function formatLsTime(date: Date): string {
+  const now = new Date();
+  const sixMonthsAgo = new Date(now.getTime() - 6 * 30 * 24 * 60 * 60 * 1000);
+
+  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  const month = months[date.getMonth()];
+  const day = date.getDate().toString().padStart(2, ' ');
+
+  // If file is older than 6 months, show year instead of time
+  if (date < sixMonthsAgo) {
+    const year = date.getFullYear();
+    return `${month} ${day}  ${year}`;
+  } else {
+    const hours = date.getHours().toString().padStart(2, '0');
+    const minutes = date.getMinutes().toString().padStart(2, '0');
+    return `${month} ${day} ${hours}:${minutes}`;
+  }
+}
+
+// Collection management commands
+function collectionList(): void {
+  const db = getDb();
+  const collections = listCollections(db);
+
+  if (collections.length === 0) {
+    console.log("No collections found. Run 'straja-vault collection add .' to create one.");
+    closeDb();
+    return;
+  }
+
+  console.log(`${c.bold}Collections (${collections.length}):${c.reset}\n`);
+
+  for (const coll of collections) {
+    const updatedAt = coll.last_modified ? new Date(coll.last_modified) : new Date();
+    const timeAgo = formatTimeAgo(updatedAt);
+    
+    // Get YAML config to check includeByDefault
+    const yamlColl = getCollectionFromYaml(coll.name);
+    const excluded = yamlColl?.includeByDefault === false;
+    const excludeTag = excluded ? ` ${c.yellow}[excluded]${c.reset}` : '';
+
+    console.log(`${c.cyan}${coll.name}${c.reset} ${c.dim}(vault://${coll.name}/)${c.reset}${excludeTag}`);
+    console.log(`  ${c.dim}Pattern:${c.reset}  ${coll.glob_pattern}`);
+    console.log(`  ${c.dim}Files:${c.reset}    ${coll.active_count}`);
+    console.log(`  ${c.dim}Updated:${c.reset}  ${timeAgo}`);
+    console.log();
+  }
+
+  closeDb();
+}
+
+async function collectionAdd(pwd: string, globPattern: string, name?: string): Promise<void> {
+  // If name not provided, generate from pwd basename
+  let collName = name;
+  if (!collName) {
+    const parts = pwd.split('/').filter(Boolean);
+    collName = parts[parts.length - 1] || 'root';
+  }
+
+  // Check if collection with this name already exists in YAML
+  const existing = getCollectionFromYaml(collName);
+  if (existing) {
+    console.error(`${c.yellow}Collection '${collName}' already exists.${c.reset}`);
+    console.error(`Use a different name with --name <name>`);
+    process.exit(1);
+  }
+
+  // Check if a collection with this pwd+glob already exists in YAML
+  const allCollections = yamlListCollections();
+  const existingPwdGlob = allCollections.find(c => c.path === pwd && c.pattern === globPattern);
+
+  if (existingPwdGlob) {
+    console.error(`${c.yellow}A collection already exists for this path and pattern:${c.reset}`);
+    console.error(`  Name: ${existingPwdGlob.name} (vault://${existingPwdGlob.name}/)`);
+    console.error(`  Pattern: ${globPattern}`);
+    console.error(`\nUse 'straja-vault update' to re-index it, or remove it first with 'straja-vault collection remove ${existingPwdGlob.name}'`);
+    process.exit(1);
+  }
+
+  // Add to YAML config
+  const { addCollection } = await import("./collections.js");
+  addCollection(collName, pwd, globPattern);
+
+  // Create the collection and index files
+  console.log(`Creating collection '${collName}'...`);
+  await indexFiles(pwd, globPattern, collName);
+  console.log(`${c.green}✓${c.reset} Collection '${collName}' created successfully`);
+}
+
+function collectionRemove(name: string): void {
+  // Check if collection exists in YAML
+  const coll = getCollectionFromYaml(name);
+  if (!coll) {
+    console.error(`${c.yellow}Collection not found: ${name}${c.reset}`);
+    console.error(`Run 'straja-vault collection list' to see available collections.`);
+    process.exit(1);
+  }
+
+  const db = getDb();
+  const result = removeCollection(db, name);
+  closeDb();
+
+  console.log(`${c.green}✓${c.reset} Removed collection '${name}'`);
+  console.log(`  Deleted ${result.deletedDocs} documents`);
+  if (result.cleanedHashes > 0) {
+    console.log(`  Cleaned up ${result.cleanedHashes} orphaned content hashes`);
+  }
+}
+
+function collectionRename(oldName: string, newName: string): void {
+  // Check if old collection exists in YAML
+  const coll = getCollectionFromYaml(oldName);
+  if (!coll) {
+    console.error(`${c.yellow}Collection not found: ${oldName}${c.reset}`);
+    console.error(`Run 'straja-vault collection list' to see available collections.`);
+    process.exit(1);
+  }
+
+  // Check if new name already exists in YAML
+  const existing = getCollectionFromYaml(newName);
+  if (existing) {
+    console.error(`${c.yellow}Collection name already exists: ${newName}${c.reset}`);
+    console.error(`Choose a different name or remove the existing collection first.`);
+    process.exit(1);
+  }
+
+  const db = getDb();
+  renameCollection(db, oldName, newName);
+  closeDb();
+
+  console.log(`${c.green}✓${c.reset} Renamed collection '${oldName}' to '${newName}'`);
+  console.log(`  Virtual paths updated: ${c.cyan}vault://${oldName}/${c.reset} → ${c.cyan}vault://${newName}/${c.reset}`);
+}
+
+/**
+ * A single unit of extracted text, optionally with a page suffix for multi-page docs.
+ */
+type ExtractedPage = { content: string; pageSuffix: string; pageNum?: number };
+
+/** Spreadsheets are converted to JSON — change the stored path extension to .json
+ *  @deprecated Used only for legacy paths. New imports use :: convention. */
+function rewriteSpreadsheetExt(docPath: string): string {
+  return docPath.replace(/\.(xlsx|xls|csv)$/i, ".json");
+}
+
+/** Map file extension to MIME type for blob envelope storage. */
+function getMimeType(ext: string): string {
+  const map: Record<string, string> = {
+    ".pdf": "application/pdf",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".xls": "application/vnd.ms-excel",
+    ".csv": "text/csv",
+  };
+  return map[ext.toLowerCase()] || "application/octet-stream";
+}
+
+/** Convert old-style pageSuffix to new :: index suffix.
+ *  "#page-3" → "3", "#sheet-sales" → "sheet-sales", "" → "text" */
+function pageToIndexSuffix(pageSuffix: string): string {
+  if (pageSuffix.startsWith("#page-")) return pageSuffix.slice(6); // "3"
+  if (pageSuffix.startsWith("#sheet-")) return pageSuffix.slice(1); // "sheet-sales"
+  return "text"; // single page/sheet → "text"
+}
+
+/**
+ * Extract text content from a file, handling binary formats (PDF, XLSX) and text files.
+ * PDFs are split by page, spreadsheets by sheet — each becomes a separate indexed document.
+ */
+async function extractText(filepath: string): Promise<ExtractedPage[]> {
+  const ext = filepath.slice(filepath.lastIndexOf('.')).toLowerCase();
+  if (ext === '.pdf') {
+    const buffer = readFileSync(filepath);
+    const { PDFParse } = await import('pdf-parse');
+    const pdf = new PDFParse({ data: new Uint8Array(buffer) });
+    const result = await pdf.getText();
+    await pdf.destroy();
+
+    // Split by page — each page is a separate document for better retrieval
+    if (result.pages && result.pages.length > 1) {
+      return result.pages
+        .filter((p: { text: string }) => p.text.trim().length > 0)
+        .map((p: { num: number; text: string }) => ({
+          content: p.text,
+          pageSuffix: `#page-${p.num}`,
+          pageNum: p.num,
+        }));
+    }
+    // Single page or no page info — return as one document
+    return [{ content: result.text, pageSuffix: "" }];
+  }
+
+  // Excel spreadsheets — convert to structured JSON (array of row objects per sheet)
+  if (ext === '.xlsx' || ext === '.xls') {
+    const XLSX = await import("xlsx");
+    const wb = XLSX.readFile(filepath);
+    if (wb.SheetNames.length === 0) {
+      return [{ content: "", pageSuffix: "" }];
+    }
+    // Single sheet → no suffix (like single-page PDF)
+    if (wb.SheetNames.length === 1) {
+      const rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]!]!);
+      return [{ content: JSON.stringify(rows, null, 2), pageSuffix: "" }];
+    }
+    // Multi-sheet → one document per sheet (like PDF pages)
+    return wb.SheetNames
+      .map((name) => {
+        const rows = XLSX.utils.sheet_to_json(wb.Sheets[name]!);
+        if (rows.length === 0) return null;
+        const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+        return {
+          content: JSON.stringify(rows, null, 2),
+          pageSuffix: `#sheet-${slug}`,
+        };
+      })
+      .filter(Boolean) as ExtractedPage[];
+  }
+
+  // CSV — convert to structured JSON (array of row objects)
+  if (ext === '.csv') {
+    const XLSX = await import("xlsx");
+    const wb = XLSX.readFile(filepath);
+    const rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]!]!);
+    return [{ content: JSON.stringify(rows, null, 2), pageSuffix: "" }];
+  }
+
+  return [{ content: readFileSync(filepath, "utf-8"), pageSuffix: "" }];
+}
+
+async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, collectionName?: string, suppressEmbedNotice: boolean = false): Promise<void> {
+  const db = getDb();
+  const resolvedPwd = pwd || getPwd();
+  const now = new Date().toISOString();
+  const excludeDirs = ["node_modules", ".git", ".cache", "vendor", "dist", "build"];
+
+  // Clear Ollama cache on index
+  clearCache(db);
+
+  // Collection name must be provided (from YAML)
+  if (!collectionName) {
+    throw new Error("Collection name is required. Collections must be defined in ~/.config/straja-vault/index.yml");
+  }
+
+  console.log(`Collection: ${resolvedPwd} (${globPattern})`);
+
+  progress.indeterminate();
+  const allFiles: string[] = await fastGlob(globPattern, {
+    cwd: resolvedPwd,
+    onlyFiles: true,
+    followSymbolicLinks: false,
+    dot: false,
+    ignore: excludeDirs.map(d => `**/${d}/**`),
+  });
+  // Filter hidden files/folders (dot: false handles top-level but not nested)
+  const files = allFiles.filter(file => {
+    const parts = file.split("/");
+    return !parts.some(part => part.startsWith("."));
+  });
+
+  const total = files.length;
+  if (total === 0) {
+    progress.clear();
+    console.log("No files found matching pattern.");
+    closeDb();
+    return;
+  }
+
+  let indexed = 0, updated = 0, unchanged = 0, processed = 0;
+  const seenPaths = new Set<string>();
+  const startTime = Date.now();
+
+  for (const relativeFile of files) {
+    const filepath = getRealPath(resolve(resolvedPwd, relativeFile));
+    const path = handelize(relativeFile); // Normalize path for token-friendliness
+    const ext = filepath.slice(filepath.lastIndexOf('.')).toLowerCase();
+    const isBinary = isBinaryImportExt(ext);
+    const stat = statSync(filepath);
+    const createdAt = stat ? new Date(stat.birthtime).toISOString() : now;
+    const modifiedAt = stat ? new Date(stat.mtime).toISOString() : now;
+
+    // Helper to upsert a document (original or index entry)
+    const upsert = async (docPath: string, content: string, title: string) => {
+      const hash = await hashContent(content);
+      const existing = findActiveDocument(db, collectionName, docPath);
+      if (existing) {
+        if (existing.hash === hash) {
+          if (existing.title !== title) { updateDocumentTitle(db, existing.id, title, now); updated++; }
+          else { unchanged++; }
+        } else {
+          insertContent(db, hash, content, now);
+          updateDocument(db, existing.id, title, hash, modifiedAt);
+          updated++;
+        }
+      } else {
+        indexed++;
+        insertContent(db, hash, content, now);
+        insertDocument(db, collectionName, docPath, title, hash, createdAt, modifiedAt);
+      }
+    };
+
+    try {
+      if (isBinary) {
+        // --- Binary file: store original blob + text index entries ---
+
+        // 1. Store original binary as blob envelope at the base path
+        const fileBytes = readFileSync(filepath);
+        const blobContent = encodeBrowserUploadBlobEnvelope(new Uint8Array(fileBytes), {
+          mimeType: getMimeType(ext),
+          originalName: relativeFile.split("/").pop(),
+        });
+        const baseTitle = extractTitle("", relativeFile);
+        seenPaths.add(path);
+        await upsert(path, blobContent, baseTitle);
+
+        // 2. Extract text and store index entries with :: suffix
+        let pages: ExtractedPage[];
+        try { pages = await extractText(filepath); } catch { processed++; continue; }
+
+        for (const page of pages) {
+          if (!page.content.trim()) continue;
+          const suffix = pageToIndexSuffix(page.pageSuffix);
+          const indexPath = buildIndexPath(path, suffix);
+          seenPaths.add(indexPath);
+
+          const title = page.pageNum
+            ? `${extractTitle(page.content, relativeFile)} — p.${page.pageNum}`
+            : extractTitle(page.content, relativeFile);
+          await upsert(indexPath, page.content, title);
+        }
+      } else {
+        // --- Text file: single document (is both original and index) ---
+        let pages: ExtractedPage[];
+        try { pages = await extractText(filepath); } catch { processed++; continue; }
+
+        for (const page of pages) {
+          if (!page.content.trim()) continue;
+          const docPath = path + page.pageSuffix;
+          seenPaths.add(docPath);
+
+          const title = page.pageNum
+            ? `${extractTitle(page.content, relativeFile)} — p.${page.pageNum}`
+            : extractTitle(page.content, relativeFile);
+          await upsert(docPath, page.content, title);
+        }
+
+        seenPaths.add(path);
+      }
+    } catch (err) {
+      console.warn(`${c.yellow}Skipping ${path}: ${err instanceof Error ? err.message : err}${c.reset}`);
+    }
+
+    processed++;
+    progress.set((processed / total) * 100);
+    const elapsed = (Date.now() - startTime) / 1000;
+    const rate = processed / elapsed;
+    const remaining = (total - processed) / rate;
+    const eta = processed > 2 ? ` ETA: ${formatETA(remaining)}` : "";
+    process.stderr.write(`\rIndexing: ${processed}/${total}${eta}        `);
+  }
+
+  // Deactivate scan-origin documents that no longer exist on disk.
+  // Manually-added files (origin: manual, gdrive, api) are protected from sync deactivation.
+  const allActive = getActiveDocumentPaths(db, collectionName, "scan");
+  let removed = 0;
+  for (const path of allActive) {
+    if (!seenPaths.has(path)) {
+      deactivateDocument(db, collectionName, path);
+      removed++;
+    }
+  }
+
+  // Clean up orphaned content hashes (content not referenced by any document)
+  const orphanedContent = cleanupOrphanedContent(db);
+
+  // Check if vector index needs updating
+  const needsEmbedding = getHashesNeedingEmbedding(db);
+
+  progress.clear();
+  console.log(`\nIndexed: ${indexed} new, ${updated} updated, ${unchanged} unchanged, ${removed} removed`);
+  if (orphanedContent > 0) {
+    console.log(`Cleaned up ${orphanedContent} orphaned content hash(es)`);
+  }
+
+  if (needsEmbedding > 0 && !suppressEmbedNotice) {
+    console.log(`\nRun 'straja-vault embed' to update embeddings (${needsEmbedding} unique hashes need vectors)`);
+  }
+
+  closeDb();
+}
+
+/**
+ * Index specific files into an existing collection.
+ * Unlike indexFiles(), this does NOT glob-scan or deactivate missing files.
+ * Files outside the collection root are copied into it automatically.
+ */
+async function indexSpecificFiles(
+  collectionName: string,
+  filePaths: string[],
+): Promise<void> {
+  const { copyFileSync } = await import("node:fs");
+  const { basename } = await import("node:path");
+  const db = getDb();
+  const now = new Date().toISOString();
+
+  // Get collection config to find root path
+  const coll = getCollectionFromYaml(collectionName);
+  if (!coll) {
+    closeDb();
+    console.error(`${c.yellow}Collection not found: ${collectionName}${c.reset}`);
+    process.exit(1);
+  }
+
+  const collRoot = existsSync(coll.path) ? getRealPath(coll.path) : coll.path;
+  const isVirtual = !existsSync(coll.path) || !statSync(coll.path).isDirectory();
+  let indexed = 0, updated = 0;
+  const errors: string[] = [];
+
+  for (const filePath of filePaths) {
+    let absolutePath = isAbsolute(filePath)
+      ? getRealPath(filePath)
+      : getRealPath(resolve(coll.path, filePath));
+
+    if (!existsSync(absolutePath)) {
+      errors.push(`File not found: ${filePath}`);
+      continue;
+    }
+
+    let relativePath: string;
+    if (isVirtual || !absolutePath.startsWith(collRoot)) {
+      // Virtual collection or file outside root — index by filename directly
+      relativePath = basename(absolutePath);
+    } else {
+      relativePath = absolutePath.slice(collRoot.length + 1);
+    }
+    const path = handelize(relativePath);
+    const ext = absolutePath.slice(absolutePath.lastIndexOf('.')).toLowerCase();
+    const isBinary = isBinaryImportExt(ext);
+    const stat = statSync(absolutePath);
+    const createdAt = stat ? new Date(stat.birthtime).toISOString() : now;
+    const modifiedAt = stat ? new Date(stat.mtime).toISOString() : now;
+
+    // Helper to upsert a document — origin="manual" so sync won't deactivate it
+    const upsert = async (docPath: string, content: string, title: string) => {
+      const hash = await hashContent(content);
+      const existing = findActiveDocument(db, collectionName, docPath);
+      if (existing) {
+        if (existing.hash !== hash) {
+          insertContent(db, hash, content, now);
+          updateDocument(db, existing.id, title, hash, modifiedAt);
+          updated++;
+        }
+      } else {
+        indexed++;
+        insertContent(db, hash, content, now);
+        insertDocument(db, collectionName, docPath, title, hash, createdAt, modifiedAt, "manual");
+      }
+    };
+
+    try {
+      if (isBinary) {
+        // Store original binary as blob envelope at the base path
+        const fileBytes = readFileSync(absolutePath);
+        const blobContent = encodeBrowserUploadBlobEnvelope(new Uint8Array(fileBytes), {
+          mimeType: getMimeType(ext),
+          originalName: relativePath.split("/").pop(),
+        });
+        await upsert(path, blobContent, extractTitle("", relativePath));
+
+        // Extract text and store index entries with :: suffix
+        let pages: ExtractedPage[];
+        try { pages = await extractText(absolutePath); }
+        catch (err) { errors.push(`Failed to extract text from ${filePath}: ${err}`); continue; }
+
+        for (const page of pages) {
+          if (!page.content.trim()) continue;
+          const suffix = pageToIndexSuffix(page.pageSuffix);
+          const indexPath = buildIndexPath(path, suffix);
+          const title = page.pageNum
+            ? `${extractTitle(page.content, relativePath)} — p.${page.pageNum}`
+            : extractTitle(page.content, relativePath);
+          await upsert(indexPath, page.content, title);
+        }
+      } else {
+        // Text file: single document (same as before)
+        let pages: ExtractedPage[];
+        try { pages = await extractText(absolutePath); }
+        catch (err) { errors.push(`Failed to extract text from ${filePath}: ${err}`); continue; }
+
+        for (const page of pages) {
+          if (!page.content.trim()) continue;
+          const docPath = path + page.pageSuffix;
+          const title = page.pageNum
+            ? `${extractTitle(page.content, relativePath)} — p.${page.pageNum}`
+            : extractTitle(page.content, relativePath);
+          await upsert(docPath, page.content, title);
+        }
+      }
+    } catch (err) {
+      errors.push(`Failed to index ${filePath}: ${err}`);
+    }
+  }
+
+  closeDb();
+
+  console.log(`Indexed: ${indexed} new, ${updated} updated`);
+  if (errors.length > 0) {
+    for (const err of errors) {
+      console.error(`${c.yellow}${err}${c.reset}`);
+    }
+  }
+}
+
+function renderProgressBar(percent: number, width: number = 30): string {
+  const filled = Math.round((percent / 100) * width);
+  const empty = width - filled;
+  const bar = "█".repeat(filled) + "░".repeat(empty);
+  return bar;
+}
+
+async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean = false): Promise<void> {
+  const db = getDb();
+  const now = new Date().toISOString();
+
+  // If force, clear all vectors
+  if (force) {
+    console.log(`${c.yellow}Force re-indexing: clearing all vectors...${c.reset}`);
+    clearAllEmbeddings(db);
+  }
+
+  // Find unique hashes that need embedding (from active documents)
+  const hashesToEmbed = getHashesForEmbedding(db);
+
+  if (hashesToEmbed.length === 0) {
+    console.log(`${c.green}✓ All content hashes already have embeddings.${c.reset}`);
+    closeDb();
+    return;
+  }
+
+  // Prepare documents with chunks
+  type ChunkItem = { hash: string; title: string; text: string; seq: number; pos: number; tokens: number; bytes: number; displayName: string };
+  const allChunks: ChunkItem[] = [];
+  let multiChunkDocs = 0;
+
+  // Chunk all documents using actual token counts
+  process.stderr.write(`Chunking ${hashesToEmbed.length} documents by token count...\n`);
+  for (const item of hashesToEmbed) {
+    const encoder = new TextEncoder();
+    const bodyBytes = encoder.encode(item.body).length;
+    if (bodyBytes === 0) continue; // Skip empty
+
+    const title = extractTitle(item.body, item.path);
+    const displayName = item.path;
+    const chunks = await chunkDocumentByTokens(item.body);  // Uses actual tokenizer
+
+    if (chunks.length > 1) multiChunkDocs++;
+
+    for (let seq = 0; seq < chunks.length; seq++) {
+      allChunks.push({
+        hash: item.hash,
+        title,
+        text: chunks[seq]!.text, // Chunk is guaranteed to exist by seq loop
+        seq,
+        pos: chunks[seq]!.pos,
+        tokens: chunks[seq]!.tokens,
+        bytes: encoder.encode(chunks[seq]!.text).length,
+        displayName,
+      });
+    }
+  }
+
+  if (allChunks.length === 0) {
+    console.log(`${c.green}✓ No non-empty documents to embed.${c.reset}`);
+    closeDb();
+    return;
+  }
+
+  const totalBytes = allChunks.reduce((sum, chk) => sum + chk.bytes, 0);
+  const totalChunks = allChunks.length;
+  const totalDocs = hashesToEmbed.length;
+
+  console.log(`${c.bold}Embedding ${totalDocs} documents${c.reset} ${c.dim}(${totalChunks} chunks, ${formatBytes(totalBytes)})${c.reset}`);
+  if (multiChunkDocs > 0) {
+    console.log(`${c.dim}${multiChunkDocs} documents split into multiple chunks${c.reset}`);
+  }
+  console.log(`${c.dim}Model: ${model}${c.reset}\n`);
+
+  // Hide cursor during embedding
+  cursor.hide();
+
+  // Wrap all LLM embedding operations in a session for lifecycle management
+  // Use 30 minute timeout for large collections
+  await withLLMSession(async (session) => {
+    // Get embedding dimensions from first chunk
+    progress.indeterminate();
+    const firstChunk = allChunks[0];
+    if (!firstChunk) {
+      throw new Error("No chunks available to embed");
+    }
+    const firstText = formatDocForEmbedding(firstChunk.text, firstChunk.title);
+    const firstResult = await session.embed(firstText);
+    if (!firstResult) {
+      throw new Error("Failed to get embedding dimensions from first chunk");
+    }
+    ensureVecTable(db, firstResult.embedding.length);
+
+    let chunksEmbedded = 0, errors = 0, bytesProcessed = 0;
+    const startTime = Date.now();
+
+    // Batch embedding for better throughput
+    // Process in batches of 32 to balance memory usage and efficiency
+    const BATCH_SIZE = 32;
+
+    for (let batchStart = 0; batchStart < allChunks.length; batchStart += BATCH_SIZE) {
+      const batchEnd = Math.min(batchStart + BATCH_SIZE, allChunks.length);
+      const batch = allChunks.slice(batchStart, batchEnd);
+
+      // Format texts for embedding
+      const texts = batch.map(chunk => formatDocForEmbedding(chunk.text, chunk.title));
+
+      try {
+        // Batch embed all texts at once (ML inference — slow, no DB lock held)
+        const embeddings = await session.embedBatch(texts);
+
+        // Insert all embeddings in a single transaction so the write lock is held
+        // briefly and then fully released for the next embedBatch() call.
+        // This avoids starving other writers (e.g. session persistence) that would
+        // otherwise compete with 64 rapid-fire auto-commit writes.
+        db.exec("BEGIN");
+        try {
+          for (let i = 0; i < batch.length; i++) {
+            const chunk = batch[i]!;
+            const embedding = embeddings[i];
+
+            if (embedding) {
+              insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), model, now);
+              chunksEmbedded++;
+            } else {
+              errors++;
+              console.error(`\n${c.yellow}⚠ Error embedding "${chunk.displayName}" chunk ${chunk.seq}${c.reset}`);
+            }
+            bytesProcessed += chunk.bytes;
+          }
+          db.exec("COMMIT");
+        } catch (txErr) {
+          db.exec("ROLLBACK");
+          throw txErr;
+        }
+      } catch (err) {
+        // If batch fails, try individual embeddings as fallback
+        for (const chunk of batch) {
+          try {
+            const text = formatDocForEmbedding(chunk.text, chunk.title);
+            const result = await session.embed(text);
+            if (result) {
+              insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now);
+              chunksEmbedded++;
+            } else {
+              errors++;
+            }
+          } catch (innerErr) {
+            errors++;
+            console.error(`\n${c.yellow}⚠ Error embedding "${chunk.displayName}" chunk ${chunk.seq}: ${innerErr}${c.reset}`);
+          }
+          bytesProcessed += chunk.bytes;
+        }
+      }
+
+      const percent = (bytesProcessed / totalBytes) * 100;
+      progress.set(percent);
+
+      const elapsed = (Date.now() - startTime) / 1000;
+      const bytesPerSec = bytesProcessed / elapsed;
+      const remainingBytes = totalBytes - bytesProcessed;
+      const etaSec = remainingBytes / bytesPerSec;
+
+      const bar = renderProgressBar(percent);
+      const percentStr = percent.toFixed(0).padStart(3);
+      const throughput = `${formatBytes(bytesPerSec)}/s`;
+      const eta = elapsed > 2 ? formatETA(etaSec) : "...";
+      const errStr = errors > 0 ? ` ${c.yellow}${errors} err${c.reset}` : "";
+
+      process.stderr.write(`\r${c.cyan}${bar}${c.reset} ${c.bold}${percentStr}%${c.reset} ${c.dim}${chunksEmbedded}/${totalChunks}${c.reset}${errStr} ${c.dim}${throughput} ETA ${eta}${c.reset}   `);
+    }
+
+    progress.clear();
+    cursor.show();
+    const totalTimeSec = (Date.now() - startTime) / 1000;
+    const avgThroughput = formatBytes(totalBytes / totalTimeSec);
+
+    console.log(`\r${c.green}${renderProgressBar(100)}${c.reset} ${c.bold}100%${c.reset}                                    `);
+    console.log(`\n${c.green}✓ Done!${c.reset} Embedded ${c.bold}${chunksEmbedded}${c.reset} chunks from ${c.bold}${totalDocs}${c.reset} documents in ${c.bold}${formatETA(totalTimeSec)}${c.reset} ${c.dim}(${avgThroughput}/s)${c.reset}`);
+    if (errors > 0) {
+      console.log(`${c.yellow}⚠ ${errors} chunks failed${c.reset}`);
+    }
+  }, { maxDuration: 30 * 60 * 1000, name: 'embed-command' });
+
+  closeDb();
+}
+
+// Sanitize a term for FTS5: remove punctuation except apostrophes
+function sanitizeFTS5Term(term: string): string {
+  // Remove all non-alphanumeric except apostrophes (for contractions like "don't")
+  return term.replace(/[^\w']/g, '').trim();
+}
+
+// Build FTS5 query: phrase-aware with fallback to individual terms
+function buildFTS5Query(query: string): string {
+  // Sanitize the full query for phrase matching
+  const sanitizedQuery = query.replace(/[^\w\s']/g, '').trim();
+
+  const terms = query
+    .split(/\s+/)
+    .map(sanitizeFTS5Term)
+    .filter(term => term.length >= 2); // Skip single chars and empty
+
+  if (terms.length === 0) return "";
+  if (terms.length === 1) return `"${terms[0]!.replace(/"/g, '""')}"`;
+
+  // Strategy: exact phrase OR proximity match OR individual terms
+  // Exact phrase matches rank highest, then close proximity, then any term
+  const phrase = `"${sanitizedQuery.replace(/"/g, '""')}"`;
+  const quotedTerms = terms.map(t => `"${t.replace(/"/g, '""')}"`);
+
+  // FTS5 NEAR syntax: NEAR(term1 term2, distance)
+  const nearPhrase = `NEAR(${quotedTerms.join(' ')}, 10)`;
+  const orTerms = quotedTerms.join(' OR ');
+
+  // Exact phrase > proximity > any term
+  return `(${phrase}) OR (${nearPhrase}) OR (${orTerms})`;
+}
+
+// Normalize BM25 score to 0-1 range using sigmoid
+function normalizeBM25(score: number): number {
+  // BM25 scores are negative in SQLite (lower = better)
+  // Typical range: -15 (excellent) to -2 (weak match)
+  // Map to 0-1 where higher is better
+  const absScore = Math.abs(score);
+  // Sigmoid-ish normalization: maps ~2-15 range to ~0.1-0.95
+  return 1 / (1 + Math.exp(-(absScore - 5) / 3));
+}
+
+type OutputOptions = {
+  format: OutputFormat;
+  full: boolean;
+  limit: number;
+  minScore: number;
+  all?: boolean;
+  collection?: string | string[];  // Filter by collection name(s)
+  lineNumbers?: boolean; // Add line numbers to output
+  context?: string;      // Optional context for query expansion
+};
+
+// Highlight query terms in text (skip short words < 3 chars)
+function highlightTerms(text: string, query: string): string {
+  if (!useColor) return text;
+  const terms = query.toLowerCase().split(/\s+/).filter(t => t.length >= 3);
+  let result = text;
+  for (const term of terms) {
+    const regex = new RegExp(`(${term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi');
+    result = result.replace(regex, `${c.yellow}${c.bold}$1${c.reset}`);
+  }
+  return result;
+}
+
+// Format score with color based on value
+function formatScore(score: number): string {
+  const pct = (score * 100).toFixed(0).padStart(3);
+  if (!useColor) return `${pct}%`;
+  if (score >= 0.7) return `${c.green}${pct}%${c.reset}`;
+  if (score >= 0.4) return `${c.yellow}${pct}%${c.reset}`;
+  return `${c.dim}${pct}%${c.reset}`;
+}
+
+// Shorten directory path for display - relative to $HOME (used for context paths, not documents)
+function shortPath(dirpath: string): string {
+  const home = homedir();
+  if (dirpath.startsWith(home)) {
+    return '~' + dirpath.slice(home.length);
+  }
+  return dirpath;
+}
+
+function outputResults(results: { file: string; displayPath: string; title: string; body: string; score: number; context?: string | null; chunkPos?: number; hash?: string; docid?: string }[], query: string, opts: OutputOptions): void {
+  const filtered = results.filter(r => r.score >= opts.minScore).slice(0, opts.limit);
+
+  if (filtered.length === 0) {
+    console.log("No results found above minimum score threshold.");
+    return;
+  }
+
+  // Helper to create vault:// URI from displayPath
+  const toVaultPath = (displayPath: string) => `vault://${displayPath}`;
+
+  if (opts.format === "json") {
+    // JSON output for LLM consumption
+    const output = filtered.map(row => {
+      const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : undefined);
+      let body = opts.full ? row.body : undefined;
+      let snippet = !opts.full ? extractSnippet(row.body, query, 300, row.chunkPos).snippet : undefined;
+      if (opts.lineNumbers) {
+        if (body) body = addLineNumbers(body);
+        if (snippet) snippet = addLineNumbers(snippet);
+      }
+      return {
+        ...(docid && { docid: `#${docid}` }),
+        score: Math.round(row.score * 100) / 100,
+        file: toVaultPath(row.displayPath),
+        title: row.title,
+        ...(row.context && { context: row.context }),
+        ...(body && { body }),
+        ...(snippet && { snippet }),
+      };
+    });
+    console.log(JSON.stringify(output, null, 2));
+  } else if (opts.format === "files") {
+    // Simple docid,score,filepath,context output
+    for (const row of filtered) {
+      const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : "");
+      const ctx = row.context ? `,"${row.context.replace(/"/g, '""')}"` : "";
+      console.log(`#${docid},${row.score.toFixed(2)},${toVaultPath(row.displayPath)}${ctx}`);
+    }
+  } else if (opts.format === "cli") {
+    for (let i = 0; i < filtered.length; i++) {
+      const row = filtered[i];
+      if (!row) continue;
+      const { line, snippet } = extractSnippet(row.body, query, 500, row.chunkPos);
+      const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : undefined);
+
+      // Line 1: filepath with docid
+      const path = toVaultPath(row.displayPath);
+      // Only show :line if we actually found a term match in the snippet body (exclude header line).
+      const snippetBody = snippet.split("\n").slice(1).join("\n").toLowerCase();
+      const hasMatch = query.toLowerCase().split(/\s+/).some(t => t.length > 0 && snippetBody.includes(t));
+      const lineInfo = hasMatch ? `:${line}` : "";
+      const docidStr = docid ? ` ${c.dim}#${docid}${c.reset}` : "";
+      console.log(`${c.cyan}${path}${c.dim}${lineInfo}${c.reset}${docidStr}`);
+
+      // Line 2: Title (if available)
+      if (row.title) {
+        console.log(`${c.bold}Title: ${row.title}${c.reset}`);
+      }
+
+      // Line 3: Context (if available)
+      if (row.context) {
+        console.log(`${c.dim}Context: ${row.context}${c.reset}`);
+      }
+
+      // Line 4: Score
+      const score = formatScore(row.score);
+      console.log(`Score: ${c.bold}${score}${c.reset}`);
+      console.log();
+
+      // Snippet with highlighting (diff-style header included)
+      let displaySnippet = opts.lineNumbers ? addLineNumbers(snippet, line) : snippet;
+      const highlighted = highlightTerms(displaySnippet, query);
+      console.log(highlighted);
+
+      // Double empty line between results
+      if (i < filtered.length - 1) console.log('\n');
+    }
+  } else if (opts.format === "md") {
+    for (let i = 0; i < filtered.length; i++) {
+      const row = filtered[i];
+      if (!row) continue;
+      const heading = row.title || row.displayPath;
+      const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : undefined);
+      let content = opts.full ? row.body : extractSnippet(row.body, query, 500, row.chunkPos).snippet;
+      if (opts.lineNumbers) {
+        content = addLineNumbers(content);
+      }
+      const docidLine = docid ? `**docid:** \`#${docid}\`\n` : "";
+      const contextLine = row.context ? `**context:** ${row.context}\n` : "";
+      console.log(`---\n# ${heading}\n${docidLine}${contextLine}\n${content}\n`);
+    }
+  } else if (opts.format === "xml") {
+    for (const row of filtered) {
+      const titleAttr = row.title ? ` title="${row.title.replace(/"/g, '&quot;')}"` : "";
+      const contextAttr = row.context ? ` context="${row.context.replace(/"/g, '&quot;')}"` : "";
+      const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : "");
+      let content = opts.full ? row.body : extractSnippet(row.body, query, 500, row.chunkPos).snippet;
+      if (opts.lineNumbers) {
+        content = addLineNumbers(content);
+      }
+      console.log(`<file docid="#${docid}" name="${toVaultPath(row.displayPath)}"${titleAttr}${contextAttr}>\n${content}\n</file>\n`);
+    }
+  } else {
+    // CSV format
+    console.log("docid,score,file,title,context,line,snippet");
+    for (const row of filtered) {
+      const { line, snippet } = extractSnippet(row.body, query, 500, row.chunkPos);
+      let content = opts.full ? row.body : snippet;
+      if (opts.lineNumbers) {
+        content = addLineNumbers(content, line);
+      }
+      const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : "");
+      const snippetText = content || "";
+      console.log(`#${docid},${row.score.toFixed(4)},${escapeCSV(toVaultPath(row.displayPath))},${escapeCSV(row.title || "")},${escapeCSV(row.context || "")},${line},${escapeCSV(snippetText)}`);
+    }
+  }
+}
+
+// Resolve -c collection filter: supports single string, array, or undefined.
+// Returns validated collection names (exits on unknown collection).
+function resolveCollectionFilter(raw: string | string[] | undefined, useDefaults: boolean = false): string[] {
+  // If no filter specified and useDefaults is true, use default collections
+  if (!raw && useDefaults) {
+    return getDefaultCollectionNames();
+  }
+  if (!raw) return [];
+  const names = Array.isArray(raw) ? raw : [raw];
+  const validated: string[] = [];
+  for (const name of names) {
+    const coll = getCollectionFromYaml(name);
+    if (!coll) {
+      console.error(`Collection not found: ${name}`);
+      closeDb();
+      process.exit(1);
+    }
+    validated.push(name);
+  }
+  return validated;
+}
+
+// Post-filter results to only include files from specified collections.
+function filterByCollections<T extends { filepath?: string; file?: string }>(results: T[], collectionNames: string[]): T[] {
+  if (collectionNames.length <= 1) return results;
+  const prefixes = collectionNames.map(n => `vault://${n}/`);
+  return results.filter(r => {
+    const path = r.filepath || r.file || '';
+    return prefixes.some(p => path.startsWith(p));
+  });
+}
+
+/**
+ * Parse structured search query syntax.
+ * Lines starting with lex:, vec:, or hyde: are routed directly.
+ * Plain lines without prefix go through query expansion.
+ * 
+ * Returns null if this is a plain query (single line, no prefix).
+ * Returns StructuredSubSearch[] if structured syntax detected.
+ * Throws if multiple plain lines (ambiguous).
+ * 
+ * Examples:
+ *   "CAP theorem"                    -> null (plain query, use expansion)
+ *   "lex: CAP theorem"               -> [{ type: 'lex', query: 'CAP theorem' }]
+ *   "lex: CAP\nvec: consistency"     -> [{ type: 'lex', ... }, { type: 'vec', ... }]
+ *   "CAP\nconsistency"               -> throws (multiple plain lines)
+ */
+function parseStructuredQuery(query: string): StructuredSubSearch[] | null {
+  const lines = query.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+  if (lines.length === 0) return null;
+
+  const prefixRe = /^(lex|vec|hyde|expand):\s*/i;
+  const searches: StructuredSubSearch[] = [];
+  const plainLines: string[] = [];
+
+  for (const line of lines) {
+    const match = line.match(prefixRe);
+    if (match) {
+      const type = match[1]!.toLowerCase() as 'lex' | 'vec' | 'hyde' | 'expand';
+      const text = line.slice(match[0].length).trim();
+      if (text.length > 0) {
+        searches.push({ type, query: text });
+      }
+    } else {
+      plainLines.push(line);
+    }
+  }
+
+  // All plain lines, no prefixes -> null (use normal expansion)
+  if (searches.length === 0 && plainLines.length === 1) {
+    return null;
+  }
+
+  // Multiple plain lines without prefixes -> ambiguous, error
+  if (plainLines.length > 1) {
+    throw new Error(
+      `Ambiguous query: multiple lines without lex:/vec:/hyde: prefix.\n` +
+      `Either use a single line (for query expansion) or prefix each line.\n` +
+      `Example:\n  lex: keyword terms\n  vec: natural language question\n  hyde: hypothetical answer passage`
+    );
+  }
+
+  // Mix of prefixed and one plain line -> treat plain as lex
+  if (plainLines.length === 1) {
+    searches.unshift({ type: 'lex', query: plainLines[0]! });
+  }
+
+  return searches.length > 0 ? searches : null;
+}
+
+function search(query: string, opts: OutputOptions): void {
+  const db = getDb();
+
+  // Validate collection filter (supports multiple -c flags)
+  // Use default collections if none specified
+  const collectionNames = resolveCollectionFilter(opts.collection, true);
+  const singleCollection = collectionNames.length === 1 ? collectionNames[0] : undefined;
+
+  // Use large limit for --all, otherwise fetch more than needed and let outputResults filter
+  const fetchLimit = opts.all ? 100000 : Math.max(50, opts.limit * 2);
+  const results = filterByCollections(
+    searchFTS(db, query, fetchLimit, singleCollection),
+    collectionNames
+  );
+
+  // Add context to results
+  const resultsWithContext = results.map(r => ({
+    file: r.filepath,
+    displayPath: r.displayPath,
+    title: r.title,
+    body: r.body || "",
+    score: r.score,
+    context: getContextForFile(db, r.filepath),
+    hash: r.hash,
+    docid: r.docid,
+  }));
+
+  closeDb();
+
+  if (resultsWithContext.length === 0) {
+    if (opts.format === "json") {
+      console.log("[]");
+    } else {
+      console.log("No results found.");
+    }
+    return;
+  }
+  outputResults(resultsWithContext, query, opts);
+}
+
+// Log query expansion as a tree to stderr (CLI progress feedback)
+function logExpansionTree(originalQuery: string, expanded: ExpandedQuery[]): void {
+  const lines: string[] = [];
+  lines.push(`${c.dim}├─ ${originalQuery}${c.reset}`);
+  for (const q of expanded) {
+    let preview = q.text.replace(/\n/g, ' ');
+    if (preview.length > 72) preview = preview.substring(0, 69) + '...';
+    lines.push(`${c.dim}├─ ${q.type}: ${preview}${c.reset}`);
+  }
+  if (lines.length > 0) {
+    lines[lines.length - 1] = lines[lines.length - 1]!.replace('├─', '└─');
+  }
+  for (const line of lines) process.stderr.write(line + '\n');
+}
+
+async function vectorSearch(query: string, opts: OutputOptions, _model: string = DEFAULT_EMBED_MODEL): Promise<void> {
+  const store = getStore();
+
+  // Validate collection filter (supports multiple -c flags)
+  // Use default collections if none specified
+  const collectionNames = resolveCollectionFilter(opts.collection, true);
+  const singleCollection = collectionNames.length === 1 ? collectionNames[0] : undefined;
+
+  checkIndexHealth(store.db);
+
+  await withLLMSession(async () => {
+    let results = await vectorSearchQuery(store, query, {
+      collection: singleCollection,
+      limit: opts.all ? 500 : (opts.limit || 10),
+      minScore: opts.minScore || 0.3,
+      hooks: {
+        onExpand: (original, expanded) => {
+          logExpansionTree(original, expanded);
+          process.stderr.write(`${c.dim}Searching ${expanded.length + 1} vector queries...${c.reset}\n`);
+        },
+      },
+    });
+
+    // Post-filter for multi-collection
+    if (collectionNames.length > 1) {
+      results = results.filter(r => {
+        const prefixes = collectionNames.map(n => `vault://${n}/`);
+        return prefixes.some(p => r.file.startsWith(p));
+      });
+    }
+
+    closeDb();
+
+    if (results.length === 0) {
+      if (opts.format === "json") {
+        console.log("[]");
+      } else {
+        console.log("No results found.");
+      }
+      return;
+    }
+
+    outputResults(results.map(r => ({
+      file: r.file,
+      displayPath: r.displayPath,
+      title: r.title,
+      body: r.body,
+      score: r.score,
+      context: r.context,
+      docid: r.docid,
+    })), query, { ...opts, limit: results.length });
+  }, { maxDuration: 10 * 60 * 1000, name: 'vectorSearch' });
+}
+
+async function querySearch(query: string, opts: OutputOptions, _embedModel: string = DEFAULT_EMBED_MODEL, _rerankModel: string = DEFAULT_RERANK_MODEL): Promise<void> {
+  const store = getStore();
+
+  // Validate collection filter (supports multiple -c flags)
+  // Use default collections if none specified
+  const collectionNames = resolveCollectionFilter(opts.collection, true);
+  const singleCollection = collectionNames.length === 1 ? collectionNames[0] : undefined;
+
+  checkIndexHealth(store.db);
+
+  // Check for structured query syntax (lex:/vec:/hyde: prefixes)
+  const structuredQueries = parseStructuredQuery(query);
+
+  await withLLMSession(async () => {
+    let results;
+
+    if (structuredQueries) {
+      // Structured search — user provided their own query expansions
+      const typeLabels = structuredQueries.map(s => s.type).join('+');
+      process.stderr.write(`${c.dim}Structured search: ${structuredQueries.length} queries (${typeLabels})${c.reset}\n`);
+      
+      // Log each sub-query
+      for (const s of structuredQueries) {
+        let preview = s.query.replace(/\n/g, ' ');
+        if (preview.length > 72) preview = preview.substring(0, 69) + '...';
+        process.stderr.write(`${c.dim}├─ ${s.type}: ${preview}${c.reset}\n`);
+      }
+      process.stderr.write(`${c.dim}└─ Searching...${c.reset}\n`);
+
+      results = await structuredSearch(store, structuredQueries, {
+        collections: singleCollection ? [singleCollection] : undefined,
+        limit: opts.all ? 500 : (opts.limit || 10),
+        minScore: opts.minScore || 0,
+        hooks: {
+          onEmbedStart: (count) => {
+            process.stderr.write(`${c.dim}Embedding ${count} ${count === 1 ? 'query' : 'queries'}...${c.reset}`);
+          },
+          onEmbedDone: (ms) => {
+            process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
+          },
+          onRerankStart: (chunkCount) => {
+            process.stderr.write(`${c.dim}Reranking ${chunkCount} chunks...${c.reset}`);
+            progress.indeterminate();
+          },
+          onRerankDone: (ms) => {
+            progress.clear();
+            process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
+          },
+        },
+      });
+    } else {
+      // Standard hybrid query with automatic expansion
+      results = await hybridQuery(store, query, {
+        collection: singleCollection,
+        limit: opts.all ? 500 : (opts.limit || 10),
+        minScore: opts.minScore || 0,
+        hooks: {
+          onStrongSignal: (score) => {
+            process.stderr.write(`${c.dim}Strong BM25 signal (${score.toFixed(2)}) — skipping expansion${c.reset}\n`);
+          },
+          onExpandStart: () => {
+            process.stderr.write(`${c.dim}Expanding query...${c.reset}`);
+          },
+          onExpand: (original, expanded, ms) => {
+            process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
+            logExpansionTree(original, expanded);
+            process.stderr.write(`${c.dim}Searching ${expanded.length + 1} queries...${c.reset}\n`);
+          },
+          onEmbedStart: (count) => {
+            process.stderr.write(`${c.dim}Embedding ${count} ${count === 1 ? 'query' : 'queries'}...${c.reset}`);
+          },
+          onEmbedDone: (ms) => {
+            process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
+          },
+          onRerankStart: (chunkCount) => {
+            process.stderr.write(`${c.dim}Reranking ${chunkCount} chunks...${c.reset}`);
+            progress.indeterminate();
+          },
+          onRerankDone: (ms) => {
+            progress.clear();
+            process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
+          },
+        },
+      });
+    }
+
+    // Post-filter for multi-collection
+    if (collectionNames.length > 1) {
+      results = results.filter(r => {
+        const prefixes = collectionNames.map(n => `vault://${n}/`);
+        return prefixes.some(p => r.file.startsWith(p));
+      });
+    }
+
+    closeDb();
+
+    if (results.length === 0) {
+      if (opts.format === "json") {
+        console.log("[]");
+      } else {
+        console.log("No results found.");
+      }
+      return;
+    }
+
+    // Use first lex/vec query for output context, or original query
+    const displayQuery = structuredQueries
+      ? (structuredQueries.find(s => s.type === 'lex')?.query || structuredQueries.find(s => s.type === 'vec')?.query || query)
+      : query;
+
+    // Map to CLI output format — use bestChunk for snippet display
+    outputResults(results.map(r => ({
+      file: r.file,
+      displayPath: r.displayPath,
+      title: r.title,
+      body: r.bestChunk,
+      chunkPos: r.bestChunkPos,
+      score: r.score,
+      context: r.context,
+      docid: r.docid,
+    })), displayQuery, { ...opts, limit: results.length });
+  }, { maxDuration: 10 * 60 * 1000, name: 'querySearch' });
+}
+
+// Parse CLI arguments using util.parseArgs
+function parseCLI() {
+  const { values, positionals } = parseArgs({
+    args: process.argv.slice(2), // Skip node and script path
+    options: {
+      // Global options
+      index: {
+        type: "string",
+      },
+      context: {
+        type: "string",
+      },
+      help: { type: "boolean", short: "h" },
+      version: { type: "boolean", short: "v" },
+      // Search options
+      n: { type: "string" },
+      "min-score": { type: "string" },
+      all: { type: "boolean" },
+      full: { type: "boolean" },
+      csv: { type: "boolean" },
+      md: { type: "boolean" },
+      xml: { type: "boolean" },
+      files: { type: "boolean" },
+      json: { type: "boolean" },
+      collection: { type: "string", short: "c", multiple: true },  // Filter by collection(s)
+      // Collection options
+      name: { type: "string" },  // collection name
+      mask: { type: "string" },  // glob pattern
+      // Embed options
+      force: { type: "boolean", short: "f" },
+      // Update options
+      pull: { type: "boolean" },  // git pull before update
+      refresh: { type: "boolean" },
+      // Get options
+      l: { type: "string" },  // max lines
+      from: { type: "string" },  // start line
+      "max-bytes": { type: "string" },  // max bytes for multi-get
+      "line-numbers": { type: "boolean" },  // add line numbers to output
+      // MCP HTTP transport options
+      http: { type: "boolean" },
+      daemon: { type: "boolean" },
+      port: { type: "string" },
+    },
+    allowPositionals: true,
+    strict: false, // Allow unknown options to pass through
+  });
+
+  // Select index name (default: "index")
+  const indexName = values.index as string | undefined;
+  if (indexName) {
+    setIndexName(indexName);
+    setConfigIndexName(indexName);
+  }
+
+  // Determine output format
+  let format: OutputFormat = "cli";
+  if (values.csv) format = "csv";
+  else if (values.md) format = "md";
+  else if (values.xml) format = "xml";
+  else if (values.files) format = "files";
+  else if (values.json) format = "json";
+
+  // Default limit: 20 for --files/--json, 5 otherwise
+  // --all means return all results (use very large limit)
+  const defaultLimit = (format === "files" || format === "json") ? 20 : 5;
+  const isAll = !!values.all;
+
+  const opts: OutputOptions = {
+    format,
+    full: !!values.full,
+    limit: isAll ? 100000 : (values.n ? parseInt(String(values.n), 10) || defaultLimit : defaultLimit),
+    minScore: values["min-score"] ? parseFloat(String(values["min-score"])) || 0 : 0,
+    all: isAll,
+    collection: values.collection as string[] | undefined,
+    lineNumbers: !!values["line-numbers"],
+  };
+
+  return {
+    command: positionals[0] || "",
+    args: positionals.slice(1),
+    query: positionals.slice(1).join(" "),
+    opts,
+    values,
+  };
+}
+
+function showHelp(): void {
+  console.log("Usage:");
+  console.log("  straja-vault collection add [path] --name <name> --mask <pattern>  - Create/index collection");
+  console.log("  straja-vault collection list           - List all collections with details");
+  console.log("  straja-vault collection remove <name>  - Remove a collection by name");
+  console.log("  straja-vault collection rename <old> <new>  - Rename a collection");
+  console.log("  straja-vault ls [collection[/path]]    - List collections or files in a collection");
+  console.log("  straja-vault context add [path] \"text\" - Add context for path (defaults to current dir)");
+  console.log("  straja-vault context list              - List all contexts");
+  console.log("  straja-vault context rm <path>         - Remove context");
+  console.log("  straja-vault get <file>[:line] [-l N] [--from N]  - Get document (optionally from line, max N lines)");
+  console.log("  straja-vault multi-get <pattern> [-l N] [--max-bytes N]  - Get multiple docs by glob or comma-separated list");
+  console.log("  straja-vault status                    - Show index status and collections");
+  console.log("  straja-vault update [--pull]           - Re-index all collections (--pull: git pull first)");
+  console.log("  straja-vault embed [-f]                - Create vector embeddings (900 tokens/chunk, 15% overlap)");
+  console.log("  straja-vault cleanup                   - Remove cache and orphaned data, vacuum DB");
+  console.log("  straja-vault query <query>             - Search with query expansion + reranking (recommended)");
+  console.log("  straja-vault query 'lex:..\\nvec:...'   - Structured search (you provide lex/vec/hyde queries)");
+  console.log("  straja-vault search <query>            - Full-text keyword search (BM25, no LLM)");
+  console.log("  straja-vault vsearch <query>           - Vector similarity search (no reranking)");
+  console.log("  straja-vault gui [--port N]            - Open vault manager TUI (requires: pip install textual httpx)");
+  console.log("  straja-vault mcp                       - Start MCP server (stdio transport)");
+  console.log("  straja-vault mcp --http [--port N]     - Start MCP server (HTTP transport, default port 8181)");
+  console.log("  straja-vault mcp --http --daemon       - Start MCP server as background daemon");
+  console.log("  straja-vault mcp stop                  - Stop background MCP daemon");
+  console.log("");
+  console.log("Global options:");
+  console.log("  --index <name>             - Use custom index name (default: index)");
+  console.log("");
+  console.log("Search options:");
+  console.log("  -n <num>                   - Number of results (default: 5, or 20 for --files)");
+  console.log("  --all                      - Return all matches (use with --min-score to filter)");
+  console.log("  --min-score <num>          - Minimum similarity score");
+  console.log("  --full                     - Output full document instead of snippet");
+  console.log("  --line-numbers             - Add line numbers to output");
+  console.log("  --files                    - Output docid,score,filepath,context (default: 20 results)");
+  console.log("  --json                     - JSON output with snippets (default: 20 results)");
+  console.log("  --csv                      - CSV output with snippets");
+  console.log("  --md                       - Markdown output");
+  console.log("  --xml                      - XML output");
+  console.log("  -c, --collection <name>    - Filter results to a specific collection");
+  console.log("");
+  console.log("Structured queries (straja-vault query):");
+  console.log("  Prefix lines with lex:, vec:, or hyde: to skip automatic expansion.");
+  console.log("  lex:  BM25 keyword search (exact terms)");
+  console.log("  vec:  Vector similarity (natural language question)");
+  console.log("  hyde: Vector similarity (hypothetical answer passage)");
+  console.log("  Example: straja-vault query $'lex: CAP theorem\\nvec: consistency vs availability tradeoff'");
+  console.log("");
+  console.log("Multi-get options:");
+  console.log("  -l <num>                   - Maximum lines per file");
+  console.log("  --max-bytes <num>          - Skip files larger than N bytes (default: 10240)");
+  console.log("  --json/--csv/--md/--xml/--files - Output format (same as search)");
+  console.log("");
+  console.log(`Index: ${getDbPath()}`);
+}
+
+async function showVersion(): Promise<void> {
+  const scriptDir = dirname(fileURLToPath(import.meta.url));
+  const pkgPath = resolve(scriptDir, "..", "package.json");
+  const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
+
+  let commit = "";
+  try {
+    commit = execSync(`git -C ${scriptDir} rev-parse --short HEAD`, { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }).trim();
+  } catch {
+    // Not a git repo or git not available
+  }
+
+  const versionStr = commit ? `${pkg.version} (${commit})` : pkg.version;
+  console.log(`straja-vault ${versionStr}`);
+}
+
+// Main CLI - only run if this is the main module
+if (fileURLToPath(import.meta.url) === process.argv[1] || process.argv[1]?.endsWith("/vault.ts") || process.argv[1]?.endsWith("/vault.js")) {
+  const cli = parseCLI();
+
+  if (cli.values.version) {
+    await showVersion();
+    process.exit(0);
+  }
+
+  if (!cli.command || cli.values.help) {
+    showHelp();
+    process.exit(cli.values.help ? 0 : 1);
+  }
+
+  switch (cli.command) {
+    case "context": {
+      const subcommand = cli.args[0];
+      if (!subcommand) {
+        console.error("Usage: straja-vault context <add|list|rm>");
+        console.error("");
+        console.error("Commands:");
+        console.error("  straja-vault context add [path] \"text\"  - Add context (defaults to current dir)");
+        console.error("  straja-vault context add / \"text\"       - Add global context to all collections");
+        console.error("  straja-vault context list                - List all contexts");
+        console.error("  straja-vault context rm <path>           - Remove context");
+        process.exit(1);
+      }
+
+      switch (subcommand) {
+        case "add": {
+          if (cli.args.length < 2) {
+            console.error("Usage: straja-vault context add [path] \"text\"");
+            console.error("");
+            console.error("Examples:");
+            console.error("  straja-vault context add \"Context for current directory\"");
+            console.error("  straja-vault context add . \"Context for current directory\"");
+            console.error("  straja-vault context add /subfolder \"Context for subfolder\"");
+            console.error("  straja-vault context add / \"Global context for all collections\"");
+            console.error("");
+            console.error("  Using virtual paths:");
+            console.error("  straja-vault context add vault://journals/ \"Context for entire journals collection\"");
+            console.error("  straja-vault context add vault://journals/2024 \"Context for 2024 journals\"");
+            process.exit(1);
+          }
+
+          let pathArg: string | undefined;
+          let contextText: string;
+
+          // Check if first arg looks like a path or if it's the context text
+          const firstArg = cli.args[1] || '';
+          const secondArg = cli.args[2];
+
+          if (secondArg) {
+            // Two args: path + context
+            pathArg = firstArg;
+            contextText = cli.args.slice(2).join(" ");
+          } else {
+            // One arg: context only (use current directory)
+            pathArg = undefined;
+            contextText = firstArg;
+          }
+
+          await contextAdd(pathArg, contextText);
+          break;
+        }
+
+        case "list": {
+          contextList();
+          break;
+        }
+
+        case "rm":
+        case "remove": {
+          if (cli.args.length < 2 || !cli.args[1]) {
+            console.error("Usage: straja-vault context rm <path>");
+            console.error("Examples:");
+            console.error("  straja-vault context rm /");
+            console.error("  straja-vault context rm vault://journals/2024");
+            process.exit(1);
+          }
+          contextRemove(cli.args[1]);
+          break;
+        }
+
+        default:
+          console.error(`Unknown subcommand: ${subcommand}`);
+          console.error("Available: add, list, rm");
+          process.exit(1);
+      }
+      break;
+    }
+
+    case "get": {
+      if (!cli.args[0]) {
+        console.error("Usage: straja-vault get <filepath>[:line] [--from <line>] [-l <lines>] [--line-numbers]");
+        process.exit(1);
+      }
+      const fromLine = cli.values.from ? parseInt(cli.values.from as string, 10) : undefined;
+      const maxLines = cli.values.l ? parseInt(cli.values.l as string, 10) : undefined;
+      getDocument(cli.args[0], fromLine, maxLines, cli.opts.lineNumbers);
+      break;
+    }
+
+    case "multi-get": {
+      if (!cli.args[0]) {
+        console.error("Usage: straja-vault multi-get <pattern> [-l <lines>] [--max-bytes <bytes>] [--json|--csv|--md|--xml|--files]");
+        console.error("  pattern: glob (e.g., 'journals/2025-05*.md') or comma-separated list");
+        process.exit(1);
+      }
+      const maxLinesMulti = cli.values.l ? parseInt(cli.values.l as string, 10) : undefined;
+      const maxBytes = cli.values["max-bytes"] ? parseInt(cli.values["max-bytes"] as string, 10) : DEFAULT_MULTI_GET_MAX_BYTES;
+      multiGet(cli.args[0], maxLinesMulti, maxBytes, cli.opts.format);
+      break;
+    }
+
+    case "ls": {
+      listFiles(cli.args[0]);
+      break;
+    }
+
+    case "collection": {
+      const subcommand = cli.args[0];
+      switch (subcommand) {
+        case "list": {
+          collectionList();
+          break;
+        }
+
+        case "add": {
+          const pwd = cli.args[1] || getPwd();
+          const resolvedPwd = pwd === '.' ? getPwd() : getRealPath(resolve(pwd));
+          const globPattern = cli.values.mask as string || DEFAULT_GLOB;
+          const name = cli.values.name as string | undefined;
+
+          await collectionAdd(resolvedPwd, globPattern, name);
+          break;
+        }
+
+        case "add-files": {
+          const name = cli.args[1];
+          const filePaths = cli.args.slice(2);
+          if (!name || filePaths.length === 0) {
+            console.error("Usage: straja-vault collection add-files <name> <file1> [file2] ...");
+            console.error("  Add specific files to an existing collection");
+            process.exit(1);
+          }
+          await indexSpecificFiles(name, filePaths);
+          break;
+        }
+
+        case "remove":
+        case "rm": {
+          if (!cli.args[1]) {
+            console.error("Usage: straja-vault collection remove <name>");
+            console.error("  Use 'straja-vault collection list' to see available collections");
+            process.exit(1);
+          }
+          collectionRemove(cli.args[1]);
+          break;
+        }
+
+        case "rename":
+        case "mv": {
+          if (!cli.args[1] || !cli.args[2]) {
+            console.error("Usage: straja-vault collection rename <old-name> <new-name>");
+            console.error("  Use 'straja-vault collection list' to see available collections");
+            process.exit(1);
+          }
+          collectionRename(cli.args[1], cli.args[2]);
+          break;
+        }
+
+        case "set-update":
+        case "update-cmd": {
+          const name = cli.args[1];
+          const cmd = cli.args.slice(2).join(' ') || null;
+          if (!name) {
+            console.error("Usage: straja-vault collection update-cmd <name> [command]");
+            console.error("  Set the command to run before indexing (e.g., 'git pull')");
+            console.error("  Omit command to clear it");
+            process.exit(1);
+          }
+          const { updateCollectionSettings, getCollection } = await import("./collections.js");
+          const col = getCollection(name);
+          if (!col) {
+            console.error(`Collection not found: ${name}`);
+            process.exit(1);
+          }
+          updateCollectionSettings(name, { update: cmd });
+          if (cmd) {
+            console.log(`✓ Set update command for '${name}': ${cmd}`);
+          } else {
+            console.log(`✓ Cleared update command for '${name}'`);
+          }
+          break;
+        }
+
+        case "include":
+        case "exclude": {
+          const name = cli.args[1];
+          if (!name) {
+            console.error(`Usage: straja-vault collection ${subcommand} <name>`);
+            console.error(`  ${subcommand === 'include' ? 'Include' : 'Exclude'} collection in default queries`);
+            process.exit(1);
+          }
+          const { updateCollectionSettings, getCollection } = await import("./collections.js");
+          const col = getCollection(name);
+          if (!col) {
+            console.error(`Collection not found: ${name}`);
+            process.exit(1);
+          }
+          const include = subcommand === 'include';
+          updateCollectionSettings(name, { includeByDefault: include });
+          console.log(`✓ Collection '${name}' ${include ? 'included in' : 'excluded from'} default queries`);
+          break;
+        }
+
+        case "show":
+        case "info": {
+          const name = cli.args[1];
+          if (!name) {
+            console.error("Usage: straja-vault collection show <name>");
+            process.exit(1);
+          }
+          const { getCollection } = await import("./collections.js");
+          const col = getCollection(name);
+          if (!col) {
+            console.error(`Collection not found: ${name}`);
+            process.exit(1);
+          }
+          console.log(`Collection: ${name}`);
+          console.log(`  Path:     ${col.path}`);
+          console.log(`  Pattern:  ${col.pattern}`);
+          console.log(`  Include:  ${col.includeByDefault !== false ? 'yes (default)' : 'no'}`);
+          if (col.update) {
+            console.log(`  Update:   ${col.update}`);
+          }
+          if (col.context) {
+            const ctxCount = Object.keys(col.context).length;
+            console.log(`  Contexts: ${ctxCount}`);
+          }
+          break;
+        }
+
+        case "help":
+        case undefined: {
+          console.log("Usage: straja-vault collection <command> [options]");
+          console.log("");
+          console.log("Commands:");
+          console.log("  list                      List all collections");
+          console.log("  add <path> [--name NAME]  Add a collection");
+          console.log("  remove <name>             Remove a collection");
+          console.log("  rename <old> <new>        Rename a collection");
+          console.log("  show <name>               Show collection details");
+          console.log("  update-cmd <name> [cmd]   Set pre-update command (e.g., 'git pull')");
+          console.log("  include <name>            Include in default queries");
+          console.log("  exclude <name>            Exclude from default queries");
+          console.log("");
+          console.log("Examples:");
+          console.log("  straja-vault collection add ~/notes --name notes");
+          console.log("  straja-vault collection update-cmd brain 'git pull'");
+          console.log("  straja-vault collection exclude archive");
+          process.exit(0);
+        }
+
+        default:
+          console.error(`Unknown subcommand: ${subcommand}`);
+          console.error("Run 'straja-vault collection help' for usage");
+          process.exit(1);
+      }
+      break;
+    }
+
+    case "status":
+      await showStatus();
+      break;
+
+    case "update":
+      await updateCollections();
+      break;
+
+    case "embed":
+      await vectorIndex(DEFAULT_EMBED_MODEL, !!cli.values.force);
+      break;
+
+    case "pull": {
+      const refresh = cli.values.refresh === undefined ? false : Boolean(cli.values.refresh);
+      const models = [
+        DEFAULT_EMBED_MODEL_URI,
+        DEFAULT_GENERATE_MODEL_URI,
+        DEFAULT_ANSWER_MODEL_URI,
+        DEFAULT_RERANK_MODEL_URI,
+      ];
+      console.log(`${c.bold}Pulling models${c.reset}`);
+      const results = await pullModels(models, {
+        refresh,
+        cacheDir: DEFAULT_MODEL_CACHE_DIR,
+      });
+      for (const result of results) {
+        const size = formatBytes(result.sizeBytes);
+        const note = result.refreshed ? "refreshed" : "cached/checked";
+        console.log(`- ${result.model} -> ${result.path} (${size}, ${note})`);
+      }
+      break;
+    }
+
+    case "search":
+      if (!cli.query) {
+        console.error("Usage: straja-vault search [options] <query>");
+        process.exit(1);
+      }
+      search(cli.query, cli.opts);
+      break;
+
+    case "vsearch":
+    case "vector-search": // undocumented alias
+      if (!cli.query) {
+        console.error("Usage: straja-vault vsearch [options] <query>");
+        process.exit(1);
+      }
+      // Default min-score for vector search is 0.3
+      if (!cli.values["min-score"]) {
+        cli.opts.minScore = 0.3;
+      }
+      await vectorSearch(cli.query, cli.opts);
+      break;
+
+    case "query":
+    case "deep-search": // undocumented alias
+      if (!cli.query) {
+        console.error("Usage: straja-vault query [options] <query>");
+        process.exit(1);
+      }
+      await querySearch(cli.query, cli.opts);
+      break;
+
+    case "mcp": {
+      const sub = cli.args[0]; // stop | status | undefined
+
+      // Cache dir for PID/log files — same dir as the index
+      const cacheDir = process.env.XDG_CACHE_HOME
+        ? resolve(process.env.XDG_CACHE_HOME, "straja-vault")
+        : resolve(homedir(), ".cache", "straja-vault");
+      const pidPath = resolve(cacheDir, "mcp.pid");
+
+      // Subcommands take priority over flags
+      if (sub === "stop") {
+        if (!existsSync(pidPath)) {
+          console.log("Not running (no PID file).");
+          process.exit(0);
+        }
+        const pid = parseInt(readFileSync(pidPath, "utf-8").trim());
+        try {
+          process.kill(pid, 0); // alive?
+          process.kill(pid, "SIGTERM");
+          unlinkSync(pidPath);
+          console.log(`Stopped Straja Vault MCP server (PID ${pid}).`);
+        } catch {
+          unlinkSync(pidPath);
+          console.log("Cleaned up stale PID file (server was not running).");
+        }
+        process.exit(0);
+      }
+
+      if (cli.values.http) {
+        const port = Number(cli.values.port) || 8181;
+
+        if (cli.values.daemon) {
+          // Guard: check if already running
+          if (existsSync(pidPath)) {
+            const existingPid = parseInt(readFileSync(pidPath, "utf-8").trim());
+            try {
+              process.kill(existingPid, 0); // alive?
+              console.error(`Already running (PID ${existingPid}). Run 'straja-vault mcp stop' first.`);
+              process.exit(1);
+            } catch {
+              // Stale PID file — continue
+            }
+          }
+
+          mkdirSync(cacheDir, { recursive: true });
+          const logPath = resolve(cacheDir, "mcp.log");
+          const logFd = openSync(logPath, "w"); // truncate — fresh log per daemon run
+          const selfPath = fileURLToPath(import.meta.url);
+          const spawnArgs = selfPath.endsWith(".ts")
+            ? ["--import", pathJoin(dirname(selfPath), "..", "node_modules", "tsx", "dist", "esm", "index.mjs"), selfPath, "mcp", "--http", "--port", String(port)]
+            : [selfPath, "mcp", "--http", "--port", String(port)];
+          const child = nodeSpawn(process.execPath, spawnArgs, {
+            stdio: ["ignore", logFd, logFd],
+            detached: true,
+          });
+          child.unref();
+          closeSync(logFd); // parent's copy; child inherited the fd
+
+          writeFileSync(pidPath, String(child.pid));
+          console.log(`Started on http://localhost:${port}/mcp (PID ${child.pid})`);
+          console.log(`Logs: ${logPath}`);
+          process.exit(0);
+        }
+
+        // Foreground HTTP mode — remove top-level cursor handlers so the
+        // async cleanup handlers in startMcpHttpServer actually run.
+        process.removeAllListeners("SIGTERM");
+        process.removeAllListeners("SIGINT");
+        const { startMcpHttpServer } = await import("./mcp.js");
+        try {
+          await startMcpHttpServer(port);
+        } catch (e: any) {
+          if (e?.code === "EADDRINUSE") {
+            console.error(`Port ${port} already in use. Try a different port with --port.`);
+            process.exit(1);
+          }
+          throw e;
+        }
+      } else {
+        // Default: stdio transport
+        const { startMcpServer } = await import("./mcp.js");
+        await startMcpServer();
+      }
+      break;
+    }
+
+    case "cleanup": {
+      const db = getDb();
+
+      // 1. Clear llm_cache
+      const cacheCount = deleteLLMCache(db);
+      console.log(`${c.green}✓${c.reset} Cleared ${cacheCount} cached API responses`);
+
+      // 2. Remove orphaned vectors
+      const orphanedVecs = cleanupOrphanedVectors(db);
+      if (orphanedVecs > 0) {
+        console.log(`${c.green}✓${c.reset} Removed ${orphanedVecs} orphaned embedding chunks`);
+      } else {
+        console.log(`${c.dim}No orphaned embeddings to remove${c.reset}`);
+      }
+
+      // 3. Remove inactive documents
+      const inactiveDocs = deleteInactiveDocuments(db);
+      if (inactiveDocs > 0) {
+        console.log(`${c.green}✓${c.reset} Removed ${inactiveDocs} inactive document records`);
+      }
+
+      // 4. Vacuum to reclaim space
+      vacuumDatabase(db);
+      console.log(`${c.green}✓${c.reset} Database vacuumed`);
+
+      closeDb();
+      break;
+    }
+
+    case "gui": {
+      const guiPort = cli.values.port ? parseInt(cli.values.port as string, 10) : 8181;
+      // Find the gui package relative to this file
+      const selfPath = fileURLToPath(import.meta.url);
+      const guiDir = pathJoin(dirname(selfPath), "..", "gui");
+
+      // Check python3 is available
+      const { spawnSync } = await import("child_process");
+      const pyCheck = spawnSync("python3", ["--version"], { stdio: "pipe" });
+      if (pyCheck.status !== 0) {
+        console.error("Error: python3 not found. Please install Python 3.8+ to use the GUI.");
+        process.exit(1);
+      }
+
+      // Check textual is installed
+      const textualCheck = spawnSync("python3", ["-c", "import textual"], { stdio: "pipe" });
+      if (textualCheck.status !== 0) {
+        console.error("Error: Textual not installed.");
+        console.error(`Install it with:  pip install textual httpx`);
+        console.error(`Or:  pip install -r ${pathJoin(guiDir, "requirements.txt")}`);
+        process.exit(1);
+      }
+
+      console.log(`Starting Straja Vault Manager UI (port ${guiPort})…`);
+      const guiProc = nodeSpawn(
+        "python3",
+        ["-m", "gui", "--port", String(guiPort)],
+        { stdio: "inherit", cwd: pathJoin(guiDir, "..") }
+      );
+      await new Promise<void>((resolve) => {
+        guiProc.on("close", () => resolve());
+        guiProc.on("error", (err) => {
+          console.error("Failed to launch GUI:", err.message);
+          resolve();
+        });
+      });
+      break;
+    }
+
+    default:
+      console.error(`Unknown command: ${cli.command}`);
+      console.error("Run 'straja-vault --help' for usage.");
+      process.exit(1);
+  }
+
+  if (cli.command !== "mcp") {
+    await disposeDefaultLlamaCpp();
+    process.exit(0);
+  }
+
+} // end if (main module)

@@ -1,0 +1,185 @@
+/* Straja Vault TUI — main stylesheet */
+
+/* ---- Root layout ---- */
+MainScreen {
+    layout: vertical;
+}
+
+#main-layout {
+    layout: vertical;
+    height: 1fr;
+}
+
+#search-bar {
+    height: 3;
+    border-bottom: solid $primary;
+}
+
+#panels {
+    layout: horizontal;
+    height: 1fr;
+}
+
+/* ---- Collection panel (left) ---- */
+#collection-panel {
+    width: 26;
+    border-right: solid $primary;
+    layout: vertical;
+}
+
+#coll-title {
+    background: $primary;
+    color: $text;
+    text-align: center;
+    height: 1;
+    padding: 0 1;
+    text-style: bold;
+}
+
+#coll-list {
+    height: 1fr;
+}
+
+.coll-actions {
+    height: auto;
+    border-top: solid $primary-darken-3;
+}
+
+.coll-btn {
+    width: 1fr;
+    height: 1;
+    margin: 0;
+    border: none;
+    background: $surface;
+    color: $text;
+}
+
+.coll-btn:hover {
+    background: $primary-darken-2;
+}
+
+/* ---- File panel (middle) ---- */
+#file-panel {
+    width: 1fr;
+    border-right: solid $primary;
+    layout: vertical;
+}
+
+#file-title {
+    background: $primary-darken-1;
+    color: $text;
+    height: 1;
+    padding: 0 1;
+}
+
+#file-list {
+    height: 1fr;
+}
+
+.file-item {
+    padding: 0 1;
+}
+
+.file-empty {
+    padding: 1 2;
+    color: $text-muted;
+}
+
+/* ---- Preview panel (right) ---- */
+#preview-panel {
+    width: 2fr;
+    layout: vertical;
+}
+
+#preview-title {
+    background: $primary-darken-2;
+    color: $text;
+    height: 1;
+    padding: 0 1;
+}
+
+#preview-scroll {
+    height: 1fr;
+    padding: 0 1;
+}
+
+#preview-empty {
+    padding: 1 2;
+    color: $text-muted;
+}
+
+/* ---- Search results (bottom, hidden by default) ---- */
+#search-results {
+    height: 12;
+    border-top: solid $primary;
+    display: none;
+}
+
+#search-results.active {
+    display: block;
+}
+
+#results-title {
+    background: $primary-darken-3;
+    color: $text;
+    height: 1;
+    padding: 0 1;
+}
+
+#results-list {
+    height: 1fr;
+}
+
+.result-item {
+    padding: 0 1;
+    height: auto;
+}
+
+.result-empty {
+    padding: 1 2;
+    color: $text-muted;
+}
+
+/* ---- Import dialog ---- */
+ImportScreen {
+    align: center middle;
+}
+
+#dialog {
+    width: 62;
+    height: auto;
+    border: solid $primary;
+    background: $surface;
+    padding: 1 2;
+}
+
+#dialog-title {
+    text-style: bold;
+    margin-bottom: 1;
+}
+
+.field-label {
+    margin-top: 1;
+    color: $text-muted;
+}
+
+.dialog-buttons {
+    margin-top: 1;
+    height: auto;
+    align: right middle;
+}
+
+.dialog-buttons Button {
+    margin-left: 1;
+}
+
+#error-msg {
+    color: $error;
+    height: auto;
+    margin-top: 1;
+    display: none;
+}
+
+#error-msg.visible {
+    display: block;
+}

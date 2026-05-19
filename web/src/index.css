@@ -1,0 +1,239 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+
+@custom-variant dark (&:is(.dark *));
+@plugin "@tailwindcss/typography";
+
+@theme inline {
+    --radius-sm: calc(var(--radius) - 4px);
+    --radius-md: calc(var(--radius) - 2px);
+    --radius-lg: var(--radius);
+    --radius-xl: calc(var(--radius) + 4px);
+    --radius-2xl: calc(var(--radius) + 8px);
+    --radius-3xl: calc(var(--radius) + 12px);
+    --radius-4xl: calc(var(--radius) + 16px);
+    --color-background: var(--background);
+    --color-foreground: var(--foreground);
+    --color-card: var(--card);
+    --color-card-foreground: var(--card-foreground);
+    --color-popover: var(--popover);
+    --color-popover-foreground: var(--popover-foreground);
+    --color-primary: var(--primary);
+    --color-primary-foreground: var(--primary-foreground);
+    --color-secondary: var(--secondary);
+    --color-secondary-foreground: var(--secondary-foreground);
+    --color-muted: var(--muted);
+    --color-muted-foreground: var(--muted-foreground);
+    --color-accent: var(--accent);
+    --color-accent-foreground: var(--accent-foreground);
+    --color-destructive: var(--destructive);
+    --color-border: var(--border);
+    --color-input: var(--input);
+    --color-ring: var(--ring);
+    --color-chart-1: var(--chart-1);
+    --color-chart-2: var(--chart-2);
+    --color-chart-3: var(--chart-3);
+    --color-chart-4: var(--chart-4);
+    --color-chart-5: var(--chart-5);
+    --color-sidebar: var(--sidebar);
+    --color-sidebar-foreground: var(--sidebar-foreground);
+    --color-sidebar-primary: var(--sidebar-primary);
+    --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+    --color-sidebar-accent: var(--sidebar-accent);
+    --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+    --color-sidebar-border: var(--sidebar-border);
+    --color-sidebar-ring: var(--sidebar-ring);
+}
+
+:root {
+    --radius: 0.625rem;
+    --background: oklch(1 0 0);
+    --foreground: oklch(0.145 0 0);
+    --card: oklch(1 0 0);
+    --card-foreground: oklch(0.145 0 0);
+    --popover: oklch(1 0 0);
+    --popover-foreground: oklch(0.145 0 0);
+    --primary: oklch(0.205 0 0);
+    --primary-foreground: oklch(0.985 0 0);
+    --secondary: oklch(0.97 0 0);
+    --secondary-foreground: oklch(0.205 0 0);
+    --muted: oklch(0.97 0 0);
+    --muted-foreground: oklch(0.556 0 0);
+    --accent: oklch(0.97 0 0);
+    --accent-foreground: oklch(0.205 0 0);
+    --destructive: oklch(0.577 0.245 27.325);
+    --border: oklch(0.922 0 0);
+    --input: oklch(0.922 0 0);
+    --ring: oklch(0.708 0 0);
+    --chart-1: oklch(0.646 0.222 41.116);
+    --chart-2: oklch(0.6 0.118 184.704);
+    --chart-3: oklch(0.398 0.07 227.392);
+    --chart-4: oklch(0.828 0.189 84.429);
+    --chart-5: oklch(0.769 0.188 70.08);
+    --sidebar: oklch(0.985 0 0);
+    --sidebar-foreground: oklch(0.145 0 0);
+    --sidebar-primary: oklch(0.205 0 0);
+    --sidebar-primary-foreground: oklch(0.985 0 0);
+    --sidebar-accent: oklch(0.97 0 0);
+    --sidebar-accent-foreground: oklch(0.205 0 0);
+    --sidebar-border: oklch(0.922 0 0);
+    --sidebar-ring: oklch(0.708 0 0);
+}
+
+.dark {
+    --background: oklch(0.145 0 0);
+    --foreground: oklch(0.985 0 0);
+    --card: oklch(0.205 0 0);
+    --card-foreground: oklch(0.985 0 0);
+    --popover: oklch(0.205 0 0);
+    --popover-foreground: oklch(0.985 0 0);
+    --primary: oklch(0.922 0 0);
+    --primary-foreground: oklch(0.205 0 0);
+    --secondary: oklch(0.269 0 0);
+    --secondary-foreground: oklch(0.985 0 0);
+    --muted: oklch(0.269 0 0);
+    --muted-foreground: oklch(0.708 0 0);
+    --accent: oklch(0.269 0 0);
+    --accent-foreground: oklch(0.985 0 0);
+    --destructive: oklch(0.704 0.191 22.216);
+    --border: oklch(1 0 0 / 10%);
+    --input: oklch(1 0 0 / 15%);
+    --ring: oklch(0.556 0 0);
+    --chart-1: oklch(0.488 0.243 264.376);
+    --chart-2: oklch(0.696 0.17 162.48);
+    --chart-3: oklch(0.769 0.188 70.08);
+    --chart-4: oklch(0.627 0.265 303.9);
+    --chart-5: oklch(0.645 0.246 16.439);
+    --sidebar: oklch(0.205 0 0);
+    --sidebar-foreground: oklch(0.985 0 0);
+    --sidebar-primary: oklch(0.488 0.243 264.376);
+    --sidebar-primary-foreground: oklch(0.985 0 0);
+    --sidebar-accent: oklch(0.269 0 0);
+    --sidebar-accent-foreground: oklch(0.985 0 0);
+    --sidebar-border: oklch(1 0 0 / 10%);
+    --sidebar-ring: oklch(0.556 0 0);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+    }
+  body {
+    @apply bg-background text-foreground;
+    font-family: 'Inter', system-ui, -apple-system, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    }
+  code, pre, kbd {
+    font-family: 'JetBrains Mono', ui-monospace, monospace;
+    }
+}
+
+.sidebar-hover-scrollbar {
+  scrollbar-width: none;
+}
+
+.sidebar-hover-scrollbar::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
+
+[data-sidebar="sidebar"]:hover .sidebar-hover-scrollbar {
+  scrollbar-width: thin;
+}
+
+[data-sidebar="sidebar"]:hover .sidebar-hover-scrollbar::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+[data-sidebar="sidebar"]:hover .sidebar-hover-scrollbar::-webkit-scrollbar-thumb {
+  background: color-mix(in oklch, var(--color-sidebar-foreground) 22%, transparent);
+  border-radius: 9999px;
+}
+
+[data-sidebar="sidebar"]:hover .sidebar-hover-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* Straja gate screen animations
+ *
+ * The 3 circles tell a story each cycle:
+ *   0-10%  jelly bounce in place
+ *  10-20%  glide into a smiley face   :)
+ *  20-32%  hold the smile
+ *  32-40%  right eye winks, grin grows ;)
+ *  40-50%  snap to surprised face      :O
+ *  50-58%  hold surprised
+ *  58-68%  burst apart with squish
+ *  68-85%  free dance
+ *  85-100% settle back to start
+ */
+
+/* Green (12,20) → mouth at (20,26): translate(8,6) */
+@keyframes logo-face-green {
+  0%, 100% { transform: translate(0, 0) scale(1, 1); }
+  5%  { transform: translate(0, -3px) scale(1.3, 0.7); }
+  10% { transform: translate(0, 1px) scale(0.82, 1.18); }
+  /* wide flat smile */
+  20% { transform: translate(8px, 6px) scale(1.9, 0.35); }
+  32% { transform: translate(8px, 6px) scale(1.9, 0.35); }
+  /* bigger grin during wink */
+  40% { transform: translate(8px, 7px) scale(2.1, 0.28); }
+  /* surprised O — small round */
+  50% { transform: translate(8px, 6px) scale(0.55, 0.55); }
+  58% { transform: translate(8px, 6px) scale(0.55, 0.55); }
+  /* burst fly down-left */
+  66% { transform: translate(-9px, 13px) scale(1.35, 0.65); }
+  /* dance */
+  75% { transform: translate(7px, -8px) scale(0.75, 1.25); }
+  83% { transform: translate(-4px, 4px) scale(1.15, 0.85); }
+  93% { transform: translate(1px, -1px) scale(1.05, 0.95); }
+}
+
+/* Orange A (25,13) → left eye at (13,12): translate(-12,-1) */
+@keyframes logo-face-a {
+  0%, 100% { transform: translate(0, 0) scale(1, 1); }
+  5%  { transform: translate(4px, -3px) scale(0.75, 1.25); }
+  10% { transform: translate(-1px, 1px) scale(1.18, 0.82); }
+  /* glide to left eye */
+  20% { transform: translate(-12px, -1px) scale(1, 1); }
+  32% { transform: translate(-12px, -1px) scale(1, 1); }
+  /* stays open during wink, slight grow */
+  40% { transform: translate(-12px, -1px) scale(1.15, 1.15); }
+  /* surprised — BIG eye */
+  50% { transform: translate(-12px, -2px) scale(1.45, 1.45); }
+  58% { transform: translate(-12px, -2px) scale(1.45, 1.45); }
+  /* burst fly upper-left */
+  66% { transform: translate(-14px, -15px) scale(0.65, 1.35); }
+  /* dance */
+  75% { transform: translate(10px, 8px) scale(1.25, 0.75); }
+  83% { transform: translate(-5px, -3px) scale(0.85, 1.12); }
+  93% { transform: translate(-1px, 0) scale(0.95, 1.05); }
+}
+
+/* Orange B (25,27) → right eye at (27,12): translate(2,-15) — this one winks! */
+@keyframes logo-face-b {
+  0%, 100% { transform: translate(0, 0) scale(1, 1); }
+  5%  { transform: translate(-3px, 4px) scale(1.25, 0.75); }
+  10% { transform: translate(1px, -1px) scale(0.82, 1.18); }
+  /* glide to right eye */
+  20% { transform: translate(2px, -15px) scale(1, 1); }
+  32% { transform: translate(2px, -15px) scale(1, 1); }
+  /* WINK — squish to thin line */
+  40% { transform: translate(2px, -15px) scale(1.15, 0.06); }
+  /* surprised — snap open WIDE */
+  50% { transform: translate(2px, -16px) scale(1.45, 1.45); }
+  58% { transform: translate(2px, -16px) scale(1.45, 1.45); }
+  /* burst fly upper-right */
+  66% { transform: translate(14px, -13px) scale(1.35, 0.65); }
+  /* dance */
+  75% { transform: translate(-8px, 10px) scale(0.75, 1.25); }
+  83% { transform: translate(4px, 2px) scale(1.12, 0.85); }
+  93% { transform: translate(0, 1px) scale(1.05, 0.95); }
+}
+@keyframes indeterminate-progress {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(300%); }
+}
