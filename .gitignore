@@ -4,6 +4,7 @@ node_modules/
 dist/
 .npmrc
 *.sqlite
+vault.db
 .DS_Store
 archive/
 texts/
