@@ -778,7 +778,12 @@ export function EvalsPage() {
     <div className="space-y-6 p-4 md:p-6">
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div className="space-y-2">
-          <h1 className="text-2xl font-semibold">Evals</h1>
+          <div className="flex flex-wrap items-center gap-2">
+            <h1 className="text-2xl font-semibold">Evals</h1>
+            <Badge variant="outline" className="border-amber-500/25 bg-amber-500/10 text-amber-700 dark:text-amber-400">
+              Beta
+            </Badge>
+          </div>
           <p className="max-w-4xl text-sm text-muted-foreground">
             Run practical suites against the real orchestration path, inspect trace-backed results, and turn good traces into reusable deterministic eval cases.
           </p>

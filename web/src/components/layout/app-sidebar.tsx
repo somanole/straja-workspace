@@ -53,6 +53,7 @@ interface NavItem {
   label: string
   end?: boolean
   badge?: React.ReactNode
+  labelBadge?: React.ReactNode
 }
 
 function OnboardingBadge() {
@@ -79,7 +80,16 @@ const navGroups: { label: string; items: NavItem[] }[] = [
     items: [
       { to: "/tasks", icon: ListTodo, label: "Tasks" },
       { to: "/flows", icon: GitBranch, label: "Flows" },
-      { to: "/evals", icon: Beaker, label: "Evals" },
+      {
+        to: "/evals",
+        icon: Beaker,
+        label: "Evals",
+        labelBadge: (
+          <span className="rounded-full border border-amber-500/25 bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-amber-700 dark:text-amber-400">
+            Beta
+          </span>
+        ),
+      },
       { to: "/orchestration", icon: Workflow, label: "Orchestration" },
     ],
   },
@@ -193,7 +203,10 @@ export function AppSidebar() {
                   >
                     <NavLink to={item.to} onClick={handleNavClick}>
                       <item.icon className="size-4" />
-                      <span>{item.label}</span>
+                      <span className="flex items-center gap-2">
+                        <span>{item.label}</span>
+                        {item.labelBadge}
+                      </span>
                     </NavLink>
                   </SidebarMenuButton>
                   {item.badge}

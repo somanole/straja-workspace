@@ -289,6 +289,18 @@ function formatSearchSummary(results: SearchResultItem[], query: string): string
   return lines.join('\n');
 }
 
+function resolveWebUiRedirectLocation(path: string): string {
+  const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+  const configuredOrigin = process.env.STRAJA_UI_ORIGIN?.trim();
+  if (!configuredOrigin) return normalizedPath;
+  try {
+    const base = configuredOrigin.endsWith("/") ? configuredOrigin : `${configuredOrigin}/`;
+    return new URL(normalizedPath, base).toString();
+  } catch {
+    return normalizedPath;
+  }
+}
+
 // =============================================================================
 // MCP Server
 // =============================================================================
@@ -13994,7 +14006,7 @@ Answer:`;
           }
 
           // Redirect to web UI
-          nodeRes.writeHead(302, { Location: "/connections?gmail=connected" });
+          nodeRes.writeHead(302, { Location: resolveWebUiRedirectLocation("/connections?gmail=connected") });
           nodeRes.end();
           log(`${ts()} GET /connections/gmail/callback → connected as ${email} (${Date.now() - reqStart}ms)`);
         } catch (err: any) {
@@ -14459,7 +14471,7 @@ Answer:`;
             startDrivePolling(config.pollIntervalMinutes);
           }
 
-          nodeRes.writeHead(302, { Location: "/connections?gdrive=connected" });
+          nodeRes.writeHead(302, { Location: resolveWebUiRedirectLocation("/connections?gdrive=connected") });
           nodeRes.end();
           log(`${ts()} GET /connections/gdrive/callback → connected as ${email} (${Date.now() - reqStart}ms)`);
         } catch (err: any) {
@@ -14869,7 +14881,7 @@ Answer:`;
             startCalendarPolling(config.pollIntervalMinutes);
           }
 
-          nodeRes.writeHead(302, { Location: "/connections?gcalendar=connected" });
+          nodeRes.writeHead(302, { Location: resolveWebUiRedirectLocation("/connections?gcalendar=connected") });
           nodeRes.end();
           log(`${ts()} GET /connections/gcalendar/callback → connected as ${tokens.email} (${Date.now() - reqStart}ms)`);
         } catch (err: any) {
@@ -15331,7 +15343,7 @@ Answer:`;
             startContactsPolling(config.pollIntervalMinutes);
           }
 
-          nodeRes.writeHead(302, { Location: "/connections?gcontacts=connected" });
+          nodeRes.writeHead(302, { Location: resolveWebUiRedirectLocation("/connections?gcontacts=connected") });
           nodeRes.end();
           log(`${ts()} GET /connections/gcontacts/callback → connected as ${tokens.email} (${Date.now() - reqStart}ms)`);
         } catch (err: any) {
@@ -15593,7 +15605,7 @@ Answer:`;
             startGitHubPolling(config.pollIntervalMinutes);
           }
 
-          nodeRes.writeHead(302, { Location: "/connections?github=connected" });
+          nodeRes.writeHead(302, { Location: resolveWebUiRedirectLocation("/connections?github=connected") });
           nodeRes.end();
           log(`${ts()} GET /connections/github/callback → connected as ${username} (${Date.now() - reqStart}ms)`);
         } catch (err: any) {
