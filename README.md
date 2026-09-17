@@ -4,6 +4,20 @@ Straja Workspace is a local-first runtime and UI for practical agent work. It co
 
 The project is built for practical agent work rather than abstract demos. A user can run tasks and flows, inspect real traces, evaluate behavior through repeatable suites, search workspace knowledge, connect external systems, and control risk boundaries from one place.
 
+## Workspace Views
+
+### Flows
+
+Build and run visual automations with triggers, branching, agent tasks, Vault lookups, file operations, HTTP requests, and notifications.
+
+![Straja Flows canvas](assets/straja-flows.png)
+
+### Agents
+
+Configure a team of specialized agents with defined roles, models, domains, and tool access.
+
+![Straja Agents team view](assets/straja-agents.png)
+
 ## What The Product Includes
 
 Straja Workspace currently ships these main areas:
